@@ -8,14 +8,11 @@ from src.pipeline import build_pipeline
 from src.model import get_model
 from src.business import optimize_threshold, apply_threshold
 
-# --- ЗОНА ВІДПОВІДАЛЬНОСТІ АЛІНИ (Моделер) ---
-# Розкоментувати та налаштувати гіперпараметри після тестів
-# from lightgbm import LGBMClassifier
-
 print("Downloading data...")
-# 1. Завантаження сирих даних (без застосування статистичних трансформацій)
 df_train = load_and_merge('data/train_transactions.csv', 'data/train_users.csv')
 df_test = load_and_merge('data/test_transactions.csv', 'data/test_users.csv')
+
+df_train.head(1000).write_csv('join_preview.csv')
 
 # 2. Підготовка базових масивів
 y = df_train['is_fraud'].to_numpy()
@@ -89,7 +86,7 @@ final_binary_predictions = apply_threshold(test_predictions, optimal_thresh)
 
 submission = pl.DataFrame({
     'id_user': df_test['id_user'],
-    'is_fraud': test_predictions
+    'is_fraud': final_binary_predictions
 })
 submission.write_csv('submission.csv')
 print("Ready! submission.csv is saved.")

@@ -5,14 +5,12 @@ from sklearn.base import BaseEstimator, TransformerMixin
 ID_COLS = ['id_user', 'card_mask_hash', 'card_holder', 'email']
 DATE_COLS = ['timestamp_tr', 'timestamp_reg']
 
-# Downloading and merging transactions with users
 def load_and_merge(transaction_path: str, users_path: str) -> pl.DataFrame:
     transactions = pl.read_csv(transaction_path, infer_schema_length=10000)
     users = pl.read_csv(users_path, infer_schema_length=10000)
-    df = transactions.join(users, on='id_user', how='left')
+    df = users.join(transactions, on='id_user', how='left')
     return df
 
-# Handling missing values with isolated state for cross-validation
 class PolarsImputer(BaseEstimator, TransformerMixin):
     def __init__(self):
         self.numeric_medians = {}
@@ -48,7 +46,6 @@ class PolarsImputer(BaseEstimator, TransformerMixin):
                 
         return df
 
-# Parsing datetime features without state retention
 class PolarsDatetimeParser(BaseEstimator, TransformerMixin):
     def __init__(self, date_cols: list):
         self.date_cols = date_cols
@@ -64,7 +61,7 @@ class PolarsDatetimeParser(BaseEstimator, TransformerMixin):
                 # Parsing string to datetime and removing timezone
                 df = df.with_columns(
                     pl.col(col)
-                    .str.to_datetime(time_zone="UTC")
+                    .str.to_datetime(time_zone="UTC", strict=False)
                     .dt.replace_time_zone(None)
                     .alias(col)
                 )
@@ -76,6 +73,6 @@ class PolarsDatetimeParser(BaseEstimator, TransformerMixin):
                     pl.col(col).dt.day().alias(f'{col}_day'),
                     pl.col(col).dt.hour().alias(f'{col}_hour'),
                     pl.col(col).dt.weekday().alias(f'{col}_weekday'),
-                ]).drop(col)
+                ])
                 
         return df

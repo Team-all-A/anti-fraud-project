@@ -39,28 +39,112 @@ class PolarsLogicalFeatures(BaseEstimator, TransformerMixin):
         return df
 
 class PolarsUserAggregator(BaseEstimator, TransformerMixin):
-    """Обчислення агрегованої історії користувача в межах поточного вікна даних."""
+    """
+    Stateful user-level агрегатор.
+    fit()   -> рахує історію користувачів на train fold і зберігає її
+    transform() -> приєднує вже обчислені агрегати до будь-якого нового X
+    """
+
+    def __init__(self, user_col: str = "id_user"):
+        self.user_col = user_col
+        self.user_stats_ = None
+        self.defaults_ = {}
+        self.feature_cols_ = []
+
     def fit(self, X: pl.DataFrame, y=None):
+        df = X.clone()
+
+        if self.user_col not in df.columns:
+            self.user_stats_ = None
+            self.defaults_ = {}
+            self.feature_cols_ = []
+            return self
+
+        agg_exprs = []
+
+        # Базові агрегати
+        agg_exprs.append(pl.len().alias("user_tx_count"))
+
+        if "status" in df.columns:
+            agg_exprs.extend([
+                (pl.col("status") == "fail").sum().alias("user_fail_count"),
+                (pl.col("status") == "success").sum().alias("user_success_count"),
+            ])
+
+        if "amount" in df.columns:
+            agg_exprs.extend([
+                pl.col("amount").mean().alias("user_amount_mean"),
+                pl.col("amount").sum().alias("user_amount_sum"),
+                pl.col("amount").max().alias("user_amount_max"),
+                pl.col("amount").std().alias("user_amount_std"),
+            ])
+
+        if "currency" in df.columns:
+            agg_exprs.append(
+                pl.col("currency").n_unique().alias("user_currency_nunique")
+            )
+
+        if "payment_country" in df.columns:
+            agg_exprs.append(
+                pl.col("payment_country").n_unique().alias("user_payment_country_nunique")
+            )
+
+        if "card_country" in df.columns:
+            agg_exprs.append(
+                pl.col("card_country").n_unique().alias("user_card_country_nunique")
+            )
+
+        if "transaction_type" in df.columns:
+            agg_exprs.append(
+                pl.col("transaction_type").n_unique().alias("user_tx_type_nunique")
+            )
+
+        self.user_stats_ = df.group_by(self.user_col).agg(agg_exprs)
+
+        self.feature_cols_ = [
+            c for c in self.user_stats_.columns
+            if c != self.user_col
+        ]
+
+        for col in self.feature_cols_:
+            dtype = self.user_stats_[col].dtype
+
+            if dtype in (pl.Float32, pl.Float64):
+                val = self.user_stats_[col].mean()
+                self.defaults_[col] = 0.0 if val is None else float(val)
+
+            elif dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+                val = self.user_stats_[col].median()
+                self.defaults_[col] = 0 if val is None else int(val)
+
+            else:
+                self.defaults_[col] = 0
+
         return self
 
     def transform(self, X: pl.DataFrame) -> pl.DataFrame:
         df = X.clone()
-        
-        if 'id_user' in df.columns:
-            # Загальна кількість транзакцій користувача
-            tx_count = df.group_by('id_user').agg(pl.len().alias('user_tx_count'))
-            df = df.join(tx_count, on='id_user', how='left')
-            
-            # Кількість неуспішних транзакцій користувача
-            if 'status' in df.columns:
-                fail_count = (
-                    df.filter(pl.col('status') == 'fail')
-                      .group_by('id_user')
-                      .agg(pl.len().alias('user_fail_count'))
-                )
-                df = df.join(fail_count, on='id_user', how='left')
-                df = df.with_columns(pl.col('user_fail_count').fill_null(0))
-                
+
+        if self.user_stats_ is None or self.user_col not in df.columns:
+            return df
+
+        df = df.join(self.user_stats_, on=self.user_col, how="left")
+
+        fill_exprs = []
+        for col, default_value in self.defaults_.items():
+            if col in df.columns:
+                fill_exprs.append(pl.col(col).fill_null(default_value).alias(col))
+
+        if fill_exprs:
+            df = df.with_columns(fill_exprs)
+
+        # Похідні ratio-фічі
+        if "user_fail_count" in df.columns and "user_tx_count" in df.columns:
+            df = df.with_columns(
+                (pl.col("user_fail_count") / pl.col("user_tx_count").clip(lower_bound=1))
+                .alias("user_fail_rate")
+            )
+
         return df
 
 class PolarsTargetEncoder(BaseEstimator, TransformerMixin):
