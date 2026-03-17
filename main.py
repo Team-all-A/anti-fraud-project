@@ -2,8 +2,11 @@ import polars as pl
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import f1_score
+
 from src.preprocessing import load_and_merge
 from src.pipeline import build_pipeline
+from src.model import get_model
+from src.business import optimize_threshold, apply_threshold
 
 # --- ЗОНА ВІДПОВІДАЛЬНОСТІ АЛІНИ (Моделер) ---
 # Розкоментувати та налаштувати гіперпараметри після тестів
@@ -38,12 +41,9 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(y)), y)):
     X_val_fold = X[val_idx]
     y_val_fold = y[val_idx]
 
-    # --- ЗОНА ВІДПОВІДАЛЬНОСТІ АЛІНИ (Моделер) ---
-    # Ініціалізація алгоритму з урахуванням дисбалансу класів (scale_pos_weight)
-    # model = LGBMClassifier(n_estimators=300, scale_pos_weight=20, random_state=42, n_jobs=-1)
-    # pipeline = build_pipeline(model=model)
-    
-    pipeline = build_pipeline() # Тимчасова заглушка
+    # 2. Ініціалізація моделі Аліни та ін'єкція її у пайплайн
+    lgbm_model = get_model()
+    pipeline = build_pipeline(model=lgbm_model)
 
     # --- ЗОНА ВІДПОВІДАЛЬНОСТІ МІШІ (Аналітик) ---
     # Фічі та фільтри Міші працюють під капотом виклику fit/transform
@@ -67,9 +67,26 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(y)), y)):
 # --- ЗОНА ВІДПОВІДАЛЬНОСТІ ДМИТРА (Бізнес-аналітик) ---
 # Дмитро має використовувати масив oof_predictions та y для розрахунку матриці витрат (Cost Matrix)
 # та пошуку оптимального порогу відсікання (Threshold Tuning), відмінного від стандартних 0.5.
+print("\n--- Етап 6: Оптимізація бізнес-метрик ---")
+# Дмитро задає економічні параметри (наприклад, пропущений фрод коштує в 10 разів більше за помилкову блокировку)
+COST_FP = 50.0  
+COST_FN = 500.0
+
+optimal_thresh, min_cost, metrics = optimize_threshold(
+    y_true=y, 
+    y_proba=oof_predictions, 
+    cost_fp=COST_FP, 
+    cost_fn=COST_FN
+)
+
+print(f"Оптимальний поріг відсікання: {optimal_thresh:.2f}")
+print(f"Мінімальні змодельовані збитки: ${min_cost:,.2f}")
+print(f"Очікувана матриця: FP={metrics['fp']}, FN={metrics['fn']}, TP={metrics['tp']}")
 
 print("\nGenerating final submission...")
 # Збереження сирих ймовірностей. Бізнес-логіка Дмитра згодом перетворить їх на 0/1 за потреби.
+final_binary_predictions = apply_threshold(test_predictions, optimal_thresh)
+
 submission = pl.DataFrame({
     'id_user': df_test['id_user'],
     'is_fraud': test_predictions

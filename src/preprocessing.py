@@ -64,7 +64,7 @@ class PolarsDatetimeParser(BaseEstimator, TransformerMixin):
                 # Parsing string to datetime and removing timezone
                 df = df.with_columns(
                     pl.col(col)
-                    .str.to_datetime(strict=False)
+                    .str.to_datetime(time_zone="UTC")
                     .dt.replace_time_zone(None)
                     .alias(col)
                 )
