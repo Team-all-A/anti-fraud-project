@@ -4,6 +4,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import f1_score
 from src.preprocessing import load_and_merge
 from src.pipeline import build_pipeline
+from src.business import evaluate_thresholds, optimize_threshold, apply_threshold
 
 # --- ЗОНА ВІДПОВІДАЛЬНОСТІ АЛІНИ (Моделер) ---
 # Розкоментувати та налаштувати гіперпараметри після тестів
@@ -68,11 +69,42 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(y)), y)):
 # Дмитро має використовувати масив oof_predictions та y для розрахунку матриці витрат (Cost Matrix)
 # та пошуку оптимального порогу відсікання (Threshold Tuning), відмінного від стандартних 0.5.
 
+COST_FP = 50.0
+COST_FN = 500.0
+
+threshold_report = evaluate_thresholds(
+    y_true=y,
+    y_proba=oof_predictions,
+    thresholds=np.arange(0.05, 1.00, 0.05),
+    cost_fp=COST_FP,
+    cost_fn=COST_FN
+)
+
+threshold_report.write_csv("threshold_report.csv")
+
+print("Оцінка моделі для різних threshold:")
+print(threshold_report)
+
+optimal_thresh, min_cost, metrics = optimize_threshold(
+    y_true=y,
+    y_proba=oof_predictions,
+    cost_fp=COST_FP,
+    cost_fn=COST_FN
+)
+
+print(f"\nОптимальний поріг відсікання: {optimal_thresh:.2f}")
+print(f"Мінімальні змодельовані збитки: ${min_cost:,.2f}")
+print(
+    f"Матриця: TP={metrics['tp']}, FP={metrics['fp']}, FN={metrics['fn']}, TN={metrics['tn']}"
+)
+
 print("\nGenerating final submission...")
 # Збереження сирих ймовірностей. Бізнес-логіка Дмитра згодом перетворить їх на 0/1 за потреби.
+final_binary_predictions = apply_threshold(test_predictions, optimal_thresh)
+
 submission = pl.DataFrame({
     'id_user': df_test['id_user'],
-    'is_fraud': test_predictions
+    'is_fraud': final_binary_predictions
 })
 submission.write_csv('submission.csv')
 print("Ready! submission.csv is saved.")
