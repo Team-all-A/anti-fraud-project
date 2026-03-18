@@ -19,7 +19,11 @@ class PolarsImputer(BaseEstimator, TransformerMixin):
     def fit(self, X: pl.DataFrame, y=None):
         numeric_cols = [
             col for col, dtype in zip(X.columns, X.dtypes)
-            if dtype in (pl.Float64, pl.Int64, pl.Float32, pl.Int32)
+            if dtype in (
+                pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+                pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+                pl.Float32, pl.Float64
+            )
         ]
         
         for col in numeric_cols:

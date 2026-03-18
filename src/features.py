@@ -2,6 +2,32 @@ import polars as pl
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
 
+def build_user_level_features(df: pl.DataFrame) -> pl.DataFrame:
+    agg_exprs = [
+        pl.len().alias("tx_count"),
+    ]
+
+    if "amount" in df.columns:
+        agg_exprs += [
+            pl.col("amount").sum().alias("amount_sum"),
+            pl.col("amount").mean().alias("amount_mean"),
+            pl.col("amount").max().alias("amount_max"),
+            pl.col("amount").std().alias("amount_std"),
+        ]
+
+    if "status" in df.columns:
+        agg_exprs += [
+            (pl.col("status") == "fail").sum().alias("fail_count"),
+            (pl.col("status") == "success").sum().alias("success_count"),
+        ]
+
+    user_level = df.group_by("id_user").agg(agg_exprs)
+
+    user_static = df.select([c for c in df.columns if c not in ["timestamp_tr"]]).unique(subset=["id_user"])
+
+    result = user_static.join(user_level, on="id_user", how="left")
+    return result
+
 class PolarsLogicalFeatures(BaseEstimator, TransformerMixin):
     """Генерація безстанових логічних прапорців та порівнянь."""
     def fit(self, X: pl.DataFrame, y=None):
