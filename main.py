@@ -1,92 +1,195 @@
-import polars as pl
+from __future__ import annotations
+
+from pathlib import Path
+
 import numpy as np
-from sklearn.model_selection import StratifiedKFold
+import polars as pl
 from sklearn.metrics import f1_score
+from sklearn.model_selection import StratifiedKFold
 
-from src.preprocessing import load_and_merge
-from src.pipeline import build_pipeline
+from src.business import apply_threshold, optimize_threshold
 from src.model import get_model
-from src.business import optimize_threshold, apply_threshold
+from src.pipeline import build_pipeline
+from src.preprocessing import load_and_merge
 
-print("Downloading data...")
-df_train = load_and_merge('data/train_transactions.csv', 'data/train_users.csv')
-df_test = load_and_merge('data/test_transactions.csv', 'data/test_users.csv')
 
-df_train.head(1000).write_csv('join_preview.csv')
+TRAIN_TRANSACTIONS_PATH = Path("data/train_transactions.csv")
+TRAIN_USERS_PATH = Path("data/train_users.csv")
+TEST_TRANSACTIONS_PATH = Path("data/test_transactions.csv")
+TEST_USERS_PATH = Path("data/test_users.csv")
 
-# 2. Підготовка базових масивів
-y = df_train['is_fraud'].to_numpy()
-X = df_train.drop('is_fraud')
-X_test = df_test  # Тестовий набір без міток не зазнає розбиття
+TARGET_COL = "is_fraud"
+ID_COL = "id_user"
 
-# 3. Налаштування Stratified K-Fold
 N_SPLITS = 5
-skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=42)
+RANDOM_STATE = 42
 
-# Масиви для збереження результатів
-oof_predictions = np.zeros(len(X))  # Out-of-Fold прогнози для аналізу Дмитра
-test_predictions = np.zeros(len(X_test)) # Фінальні прогнози для submission
-
-print(f"Starting {N_SPLITS}-Fold Stratified Cross-Validation...")
-
-for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(y)), y)):
-    print(f"\n--- Fold {fold + 1} ---")
-
-    # 4. Ізольоване розбиття Polars DataFrame за індексами NumPy
-    X_train_fold = X[train_idx]
-    y_train_fold = y[train_idx]
-    X_val_fold = X[val_idx]
-    y_val_fold = y[val_idx]
-
-    # 2. Ініціалізація моделі Аліни та ін'єкція її у пайплайн
-    lgbm_model = get_model()
-    pipeline = build_pipeline(model=lgbm_model)
-
-    # --- ЗОНА ВІДПОВІДАЛЬНОСТІ МІШІ (Аналітик) ---
-    # Фічі та фільтри Міші працюють під капотом виклику fit/transform
-    # Їхня логіка зашита в PolarsFeatureEngineer та PolarsTargetEncoder у файлі pipeline.py
-
-    # 5. Навчання пайплайну виключно на K-1 фолдах
-    pipeline.fit(X_train_fold, y_train_fold)
-
-    # 6. Валідація на K-тому фолді (без витоку даних)
-    val_preds_proba = pipeline.predict_proba(X_val_fold)[:, 1]
-    val_preds_binary = pipeline.predict(X_val_fold)
-    
-    oof_predictions[val_idx] = val_preds_proba
-    fold_f1 = f1_score(y_val_fold, val_preds_binary)
-    print(f"Fold {fold + 1} F1-Score: {fold_f1:.4f}")
-
-    # 7. Генерація прогнозів для реального тестового файлу
-    # Результат усереднюється між усіма фолдами для підвищення стабільності
-    test_predictions += pipeline.predict_proba(X_test)[:, 1] / N_SPLITS
-
-# --- ЗОНА ВІДПОВІДАЛЬНОСТІ ДМИТРА (Бізнес-аналітик) ---
-# Дмитро має використовувати масив oof_predictions та y для розрахунку матриці витрат (Cost Matrix)
-# та пошуку оптимального порогу відсікання (Threshold Tuning), відмінного від стандартних 0.5.
-print("\n--- Етап 6: Оптимізація бізнес-метрик ---")
-# Дмитро задає економічні параметри (наприклад, пропущений фрод коштує в 10 разів більше за помилкову блокировку)
-COST_FP = 50.0  
+COST_FP = 50.0
 COST_FN = 500.0
 
-optimal_thresh, min_cost, metrics = optimize_threshold(
-    y_true=y, 
-    y_proba=oof_predictions, 
-    cost_fp=COST_FP, 
-    cost_fn=COST_FN
-)
+SUBMISSION_PATH = Path("submission.csv")
 
-print(f"Оптимальний поріг відсікання: {optimal_thresh:.2f}")
-print(f"Мінімальні змодельовані збитки: ${min_cost:,.2f}")
-print(f"Очікувана матриця: FP={metrics['fp']}, FN={metrics['fn']}, TP={metrics['tp']}")
 
-print("\nGenerating final submission...")
-# Збереження сирих ймовірностей. Бізнес-логіка Дмитра згодом перетворить їх на 0/1 за потреби.
-final_binary_predictions = apply_threshold(test_predictions, optimal_thresh)
+def load_datasets() -> tuple[pl.DataFrame, pl.DataFrame]:
+    print("Loading and merging datasets...")
 
-submission = pl.DataFrame({
-    'id_user': df_test['id_user'],
-    'is_fraud': final_binary_predictions
-})
-submission.write_csv('submission.csv')
-print("Ready! submission.csv is saved.")
+    train_df = load_and_merge(
+        str(TRAIN_TRANSACTIONS_PATH),
+        str(TRAIN_USERS_PATH),
+    )
+    test_df = load_and_merge(
+        str(TEST_TRANSACTIONS_PATH),
+        str(TEST_USERS_PATH),
+    )
+
+    print(f"Train shape: {train_df.shape}")
+    print(f"Test shape:  {test_df.shape}")
+    return train_df, test_df
+
+
+def split_features_and_target(train_df: pl.DataFrame) -> tuple[pl.DataFrame, np.ndarray]:
+    y = train_df.get_column(TARGET_COL).to_numpy()
+    X = train_df.drop(TARGET_COL)
+    return X, y
+
+
+def select_rows(df: pl.DataFrame, indices: np.ndarray) -> pl.DataFrame:
+    return (
+        df.with_row_index("__row_nr")
+        .filter(pl.col("__row_nr").is_in(indices.tolist()))
+        .drop("__row_nr")
+    )
+
+
+def run_cross_validation(
+    X: pl.DataFrame,
+    y: np.ndarray,
+    X_test: pl.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, list[float]]:
+    skf = StratifiedKFold(
+        n_splits=N_SPLITS,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
+
+    oof_proba = np.zeros(X.height, dtype=float)
+    test_proba = np.zeros(X_test.height, dtype=float)
+    fold_f1_scores: list[float] = []
+
+    print(f"\nStarting {N_SPLITS}-fold Stratified Cross-Validation...")
+
+    for fold_number, (train_idx, val_idx) in enumerate(
+        skf.split(np.zeros(len(y)), y),
+        start=1,
+    ):
+        print(f"\n--- Fold {fold_number}/{N_SPLITS} ---")
+
+        X_train_fold = select_rows(X, train_idx)
+        X_val_fold = select_rows(X, val_idx)
+        y_train_fold = y[train_idx]
+        y_val_fold = y[val_idx]
+
+        model = get_model(y_train_fold)
+        pipeline = build_pipeline(model=model)
+
+        pipeline.fit(X_train_fold, y_train_fold)
+
+        val_proba = pipeline.predict_proba(X_val_fold)[:, 1]
+        test_fold_proba = pipeline.predict_proba(X_test)[:, 1]
+
+        oof_proba[val_idx] = val_proba
+        test_proba += test_fold_proba / N_SPLITS
+
+        val_pred_default = apply_threshold(val_proba, 0.5)
+        fold_f1 = f1_score(y_val_fold, val_pred_default, zero_division=0)
+        fold_f1_scores.append(fold_f1)
+
+        pred_fraud_count = int((val_proba >= 0.5).sum())
+        true_fraud_count = int(y_val_fold.sum())
+
+        print(f"Fold F1 @ 0.50: {fold_f1:.4f}")
+        print(
+            f"Validation positives: true={true_fraud_count}, predicted={pred_fraud_count}, "
+            f"proba min/mean/max={val_proba.min():.4f}/{val_proba.mean():.4f}/{val_proba.max():.4f}"
+        )
+
+    return oof_proba, test_proba, fold_f1_scores
+
+
+def evaluate_business_threshold(
+    y_true: np.ndarray,
+    oof_proba: np.ndarray,
+) -> float:
+    print("\nOptimizing business threshold...")
+
+    optimal_threshold, min_cost, metrics = optimize_threshold(
+        y_true=y_true,
+        y_proba=oof_proba,
+        cost_fp=COST_FP,
+        cost_fn=COST_FN,
+    )
+
+    print(f"Optimal threshold: {optimal_threshold:.2f}")
+    print(f"Minimum modeled cost: ${min_cost:,.2f}")
+    print(
+        f"Confusion matrix: TN={metrics['tn']}, FP={metrics['fp']}, "
+        f"FN={metrics['fn']}, TP={metrics['tp']}"
+    )
+
+    if "precision" in metrics and "recall" in metrics and "f1" in metrics:
+        print(
+            f"Precision={metrics['precision']:.4f}, "
+            f"Recall={metrics['recall']:.4f}, "
+            f"F1={metrics['f1']:.4f}"
+        )
+
+    return optimal_threshold
+
+
+def save_submission(
+    test_df: pl.DataFrame,
+    test_proba: np.ndarray,
+    threshold: float,
+    output_path: Path = SUBMISSION_PATH,
+) -> None:
+    final_predictions = apply_threshold(test_proba, threshold)
+
+    submission = pl.DataFrame(
+        {
+            ID_COL: test_df.get_column(ID_COL),
+            TARGET_COL: final_predictions,
+        }
+    )
+
+    submission.write_csv(output_path)
+    print(f"\nSaved submission to: {output_path}")
+
+
+def main() -> None:
+    train_df, test_df = load_datasets()
+    X, y = split_features_and_target(train_df)
+
+    oof_proba, test_proba, fold_f1_scores = run_cross_validation(
+        X=X,
+        y=y,
+        X_test=test_df,
+    )
+
+    print("\nCross-validation summary")
+    print(f"Mean fold F1 @ 0.50: {np.mean(fold_f1_scores):.4f}")
+    print(f"Std fold F1  @ 0.50: {np.std(fold_f1_scores):.4f}")
+
+    optimal_threshold = evaluate_business_threshold(
+        y_true=y,
+        oof_proba=oof_proba,
+    )
+
+    save_submission(
+        test_df=test_df,
+        test_proba=test_proba,
+        threshold=optimal_threshold,
+    )
+
+
+if __name__ == "__main__":
+    main()
