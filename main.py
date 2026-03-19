@@ -4,191 +4,121 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from sklearn.metrics import f1_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import classification_report, f1_score
 
-from src.business import apply_threshold, optimize_threshold
-from src.model import get_model
-from src.pipeline import build_pipeline
-from src.preprocessing import load_and_merge
+from src.flat_features import align_to_features, build_features, to_model_matrix
+from src.model import (
+    FraudLGBMClassifier,
+    default_params,
+    run_optuna,
+    suggest_scale_pos_weight,
+)
 
 
-TRAIN_TRANSACTIONS_PATH = Path("data/train_transactions.csv")
-TRAIN_USERS_PATH = Path("data/train_users.csv")
-TEST_TRANSACTIONS_PATH = Path("data/test_transactions.csv")
-TEST_USERS_PATH = Path("data/test_users.csv")
+DATA_DIR = Path("data")
+TRAIN_USERS = DATA_DIR / "train_users.csv"
+TRAIN_TRX = DATA_DIR / "train_transactions.csv"
+TEST_USERS = DATA_DIR / "test_users.csv"
+TEST_TRX = DATA_DIR / "test_transactions.csv"
 
-TARGET_COL = "is_fraud"
-ID_COL = "id_user"
-
-N_SPLITS = 5
 RANDOM_STATE = 42
-
-COST_FP = 50.0
-COST_FN = 500.0
-
-SUBMISSION_PATH = Path("submission.csv")
-
-
-def load_datasets() -> tuple[pl.DataFrame, pl.DataFrame]:
-    print("Loading and merging datasets...")
-
-    train_df = load_and_merge(
-        str(TRAIN_TRANSACTIONS_PATH),
-        str(TRAIN_USERS_PATH),
-    )
-    test_df = load_and_merge(
-        str(TEST_TRANSACTIONS_PATH),
-        str(TEST_USERS_PATH),
-    )
-
-    print(f"Train shape: {train_df.shape}")
-    print(f"Test shape:  {test_df.shape}")
-    return train_df, test_df
+TRAIN_RATIO = 0.70
+VAL_RATIO = 0.15
+USE_OPTUNA = False
+N_TRIALS = 30
 
 
-def split_features_and_target(train_df: pl.DataFrame) -> tuple[pl.DataFrame, np.ndarray]:
-    y = train_df.get_column(TARGET_COL).to_numpy()
-    X = train_df.drop(TARGET_COL)
-    return X, y
+PRESET_PARAMS: dict | None = None
 
 
-def select_rows(df: pl.DataFrame, indices: np.ndarray) -> pl.DataFrame:
-    return (
-        df.with_row_index("__row_nr")
-        .filter(pl.col("__row_nr").is_in(indices.tolist()))
-        .drop("__row_nr")
-    )
+def load_raw_data() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    print("Loading raw datasets...")
+    train_users = pl.read_csv(TRAIN_USERS, infer_schema_length=10_000)
+    train_trx = pl.read_csv(TRAIN_TRX, infer_schema_length=10_000)
+    test_users = pl.read_csv(TEST_USERS, infer_schema_length=10_000)
+    test_trx = pl.read_csv(TEST_TRX, infer_schema_length=10_000)
+    return train_users, train_trx, test_users, test_trx
 
 
-def run_cross_validation(
-    X: pl.DataFrame,
-    y: np.ndarray,
-    X_test: pl.DataFrame,
-) -> tuple[np.ndarray, np.ndarray, list[float]]:
-    skf = StratifiedKFold(
-        n_splits=N_SPLITS,
-        shuffle=True,
-        random_state=RANDOM_STATE,
-    )
+def time_aware_split(df_train_full: pl.DataFrame):
+    df_sorted = df_train_full.sort("timestamp_reg", nulls_last=True)
+    n = len(df_sorted)
+    n_train = int(n * TRAIN_RATIO)
+    n_val = int(n * VAL_RATIO)
 
-    oof_proba = np.zeros(X.height, dtype=float)
-    test_proba = np.zeros(X_test.height, dtype=float)
-    fold_f1_scores: list[float] = []
-
-    print(f"\nStarting {N_SPLITS}-fold Stratified Cross-Validation...")
-
-    for fold_number, (train_idx, val_idx) in enumerate(
-        skf.split(np.zeros(len(y)), y),
-        start=1,
-    ):
-        print(f"\n--- Fold {fold_number}/{N_SPLITS} ---")
-
-        X_train_fold = select_rows(X, train_idx)
-        X_val_fold = select_rows(X, val_idx)
-        y_train_fold = y[train_idx]
-        y_val_fold = y[val_idx]
-
-        model = get_model(y_train_fold)
-        pipeline = build_pipeline(model=model)
-
-        pipeline.fit(X_train_fold, y_train_fold)
-
-        val_proba = pipeline.predict_proba(X_val_fold)[:, 1]
-        test_fold_proba = pipeline.predict_proba(X_test)[:, 1]
-
-        oof_proba[val_idx] = val_proba
-        test_proba += test_fold_proba / N_SPLITS
-
-        val_pred_default = apply_threshold(val_proba, 0.5)
-        fold_f1 = f1_score(y_val_fold, val_pred_default, zero_division=0)
-        fold_f1_scores.append(fold_f1)
-
-        pred_fraud_count = int((val_proba >= 0.5).sum())
-        true_fraud_count = int(y_val_fold.sum())
-
-        print(f"Fold F1 @ 0.50: {fold_f1:.4f}")
-        print(
-            f"Validation positives: true={true_fraud_count}, predicted={pred_fraud_count}, "
-            f"proba min/mean/max={val_proba.min():.4f}/{val_proba.mean():.4f}/{val_proba.max():.4f}"
-        )
-
-    return oof_proba, test_proba, fold_f1_scores
+    train_df = df_sorted[:n_train]
+    val_df = df_sorted[n_train:n_train + n_val]
+    holdout_df = df_sorted[n_train + n_val:]
+    return train_df, val_df, holdout_df
 
 
-def evaluate_business_threshold(
-    y_true: np.ndarray,
-    oof_proba: np.ndarray,
-) -> float:
-    print("\nOptimizing business threshold...")
+def pick_params(X_train: np.ndarray, y_train: np.ndarray) -> dict:
+    if PRESET_PARAMS is not None:
+        return PRESET_PARAMS
 
-    optimal_threshold, min_cost, metrics = optimize_threshold(
-        y_true=y_true,
-        y_proba=oof_proba,
-        cost_fp=COST_FP,
-        cost_fn=COST_FN,
-    )
+    if USE_OPTUNA:
+        print(f"Running Optuna ({N_TRIALS} trials)...")
+        return run_optuna(X_train, y_train, n_trials=N_TRIALS)
 
-    print(f"Optimal threshold: {optimal_threshold:.2f}")
-    print(f"Minimum modeled cost: ${min_cost:,.2f}")
-    print(
-        f"Confusion matrix: TN={metrics['tn']}, FP={metrics['fp']}, "
-        f"FN={metrics['fn']}, TP={metrics['tp']}"
-    )
-
-    if "precision" in metrics and "recall" in metrics and "f1" in metrics:
-        print(
-            f"Precision={metrics['precision']:.4f}, "
-            f"Recall={metrics['recall']:.4f}, "
-            f"F1={metrics['f1']:.4f}"
-        )
-
-    return optimal_threshold
-
-
-def save_submission(
-    test_df: pl.DataFrame,
-    test_proba: np.ndarray,
-    threshold: float,
-    output_path: Path = SUBMISSION_PATH,
-) -> None:
-    final_predictions = apply_threshold(test_proba, threshold)
-
-    submission = pl.DataFrame(
-        {
-            ID_COL: test_df.get_column(ID_COL),
-            TARGET_COL: final_predictions,
-        }
-    )
-
-    submission.write_csv(output_path)
-    print(f"\nSaved submission to: {output_path}")
+    pos_weight = suggest_scale_pos_weight(y_train)
+    return default_params(scale_pos_weight=pos_weight)
 
 
 def main() -> None:
-    train_df, test_df = load_datasets()
-    X, y = split_features_and_target(train_df)
+    train_users, train_trx, test_users, test_trx = load_raw_data()
 
-    oof_proba, test_proba, fold_f1_scores = run_cross_validation(
-        X=X,
-        y=y,
-        X_test=test_df,
+    print("Building user-level features...")
+    df_train_full = build_features(train_users, train_trx)
+    df_test_full = build_features(test_users, test_trx)
+
+    print(f"Train flat shape: {df_train_full.shape}")
+    print(f"Test flat shape:  {df_test_full.shape}")
+
+    train_df, val_df, holdout_df = time_aware_split(df_train_full)
+
+    X_train, feat_names = to_model_matrix(train_df)
+    X_val = align_to_features(val_df, feat_names)
+    X_hold = align_to_features(holdout_df, feat_names)
+
+    y_train = train_df["is_fraud"].to_numpy().astype(np.int8)
+    y_val = val_df["is_fraud"].to_numpy().astype(np.int8)
+    y_hold = holdout_df["is_fraud"].to_numpy().astype(np.int8)
+
+    params = pick_params(X_train, y_train)
+    print("Model params:")
+    print(params)
+
+    print("Training validation model...")
+    model = FraudLGBMClassifier(lgbm_params=params)
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
+    val_f1, best_thr = model.tune_threshold(X_val, y_val)
+    print(f"Validation threshold={best_thr:.3f} | val F1={val_f1:.4f}")
+
+    hold_preds = model.predict(X_hold)
+    hold_f1 = f1_score(y_hold, hold_preds, zero_division=0)
+    print("=" * 45)
+    print(f"HOLDOUT F1: {hold_f1:.4f}")
+    print(f"Threshold : {model.threshold_:.3f}")
+    print("=" * 45)
+    print(classification_report(y_hold, hold_preds, target_names=["not fraud", "fraud"], zero_division=0))
+
+    print("Retraining on full train set...")
+    X_full, full_feat_names = to_model_matrix(df_train_full)
+    y_full = df_train_full["is_fraud"].to_numpy().astype(np.int8)
+    X_test = align_to_features(df_test_full, full_feat_names)
+
+    final_model = FraudLGBMClassifier(lgbm_params=params, threshold=model.threshold_)
+    final_model.fit(X_full, y_full)
+
+    test_preds = final_model.predict(X_test)
+    submission = pl.DataFrame(
+        {
+            "id_user": test_users["id_user"],
+            "is_fraud": test_preds.tolist(),
+        }
     )
-
-    print("\nCross-validation summary")
-    print(f"Mean fold F1 @ 0.50: {np.mean(fold_f1_scores):.4f}")
-    print(f"Std fold F1  @ 0.50: {np.std(fold_f1_scores):.4f}")
-
-    optimal_threshold = evaluate_business_threshold(
-        y_true=y,
-        oof_proba=oof_proba,
-    )
-
-    save_submission(
-        test_df=test_df,
-        test_proba=test_proba,
-        threshold=optimal_threshold,
-    )
+    submission.write_csv("submission.csv")
+    print(f"Saved submission.csv | rows={len(submission)} | fraud={int(test_preds.sum())} ({test_preds.mean() * 100:.2f}%)")
 
 
 if __name__ == "__main__":

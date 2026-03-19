@@ -117,7 +117,7 @@ class PolarsToModelFrame(BaseEstimator, TransformerMixin):
 
         df = df.select(self.feature_names_)
 
-        return df.to_pandas()
+        return pd.DataFrame(df.to_dict(as_series=False), columns=self.feature_names_)
 
 
 def build_pipeline(
