@@ -558,6 +558,7 @@ def prepare_ml_zone(
     Return ML-zone only.
     This is what you should feed into LightGBM / sklearn afterwards.
     """
+    
     if cfg is None:
         cfg = RuleConfig()
 
@@ -568,7 +569,12 @@ def prepare_ml_zone(
 
     y = None
     if is_train and "is_fraud" in ml_df.columns:
+        # 1. Спочатку зберігаємо цільову змінну
         y = ml_df.get_column("is_fraud").to_numpy()
+
+    # 2. Потім видаляємо зайві колонки згідно з конфігурацією
+    drop_cols = [c for c in cfg.drop_for_ml if c in ml_df.columns]
+    ml_df = ml_df.drop(drop_cols)
 
     return ml_df, y
 
