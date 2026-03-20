@@ -8,7 +8,6 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 
 ID_COLS   = ["id_user", "card_mask_hash", "card_holder", "email"]
-DATE_COLS = ["timestamp_tr", "timestamp_reg"]
 
 NUMERIC_DTYPES = {
     pl.Int8, pl.Int16, pl.Int32, pl.Int64,
@@ -41,63 +40,6 @@ def load_and_merge(transaction_path: str, users_path: str) -> pl.DataFrame:
         users = users.unique(subset=["id_user"], keep="first")
 
     return users.join(transactions, on="id_user", how="left")
-
-
-# ── Datetime parser (stateless) ───────────────────────────────────────────────
-
-class PolarsDatetimeParser(BaseEstimator, TransformerMixin):
-    """
-    Parse raw datetime strings into Polars Datetime and add calendar columns.
-
-    Stateless — safe to call globally before any fold split.
-    """
-
-    def __init__(self, date_cols: list[str] = None):
-        self.date_cols = date_cols or DATE_COLS
-
-    def fit(self, X: pl.DataFrame, y=None):
-        return self
-
-    def transform(self, X: pl.DataFrame) -> pl.DataFrame:
-        df = X.clone()
-        for col in self.date_cols:
-            df = self._parse_col(df, col)
-        return df
-
-    def _parse_col(self, df: pl.DataFrame, col: str) -> pl.DataFrame:
-        if col not in df.columns:
-            return df
-
-        dtype = df.schema[col]
-
-        if dtype == pl.Datetime:
-            parsed = pl.col(col).dt.replace_time_zone(None).alias(col)
-        elif dtype == pl.Date:
-            parsed = pl.col(col).cast(pl.Datetime).alias(col)
-        else:
-            parsed = (
-                pl.col(col)
-                .cast(pl.Utf8, strict=False)
-                .str.strip_chars()
-                .str.to_datetime(time_zone="UTC", strict=False)
-                .dt.replace_time_zone(None)
-                .alias(col)
-            )
-
-        df = df.with_columns([
-            parsed,
-            pl.col(col).is_null().cast(pl.Int8).alias(f"{col}_is_missing"),
-        ])
-
-        df = df.with_columns([
-            pl.col(col).dt.year().alias(f"{col}_year"),
-            pl.col(col).dt.month().alias(f"{col}_month"),
-            pl.col(col).dt.day().alias(f"{col}_day"),
-            pl.col(col).dt.hour().alias(f"{col}_hour"),
-            pl.col(col).dt.weekday().alias(f"{col}_weekday"),
-        ])
-
-        return df
 
 
 # ── Imputer (stateful — fit on train fold only) ───────────────────────────────
