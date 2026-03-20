@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 from src.business import optimize_threshold
@@ -166,7 +166,6 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(y)), y), star
     oof_proba[val_idx] = model.predict_proba(X_val_pd)[:, 1]
     test_proba        += model.predict_proba(X_test_pd)[:, 1] / N_SPLITS
 
-    from sklearn.metrics import roc_auc_score
     val_proba = oof_proba[val_idx]
     fold_auc  = roc_auc_score(y_val_fold, val_proba)
     fold_f1s.append(fold_auc)
