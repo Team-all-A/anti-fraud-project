@@ -582,11 +582,16 @@ def build_submission(
 
     ml_ids = test_filtered.filter(pl.col("rule_decision") == "SEND_TO_ML").select("id_user")
 
-    if ml_proba is not None and ml_ids.height > 0:
-        ml_labels = (ml_proba >= best_threshold).astype(np.int32)
-        parts.append(
-            ml_ids.with_columns(pl.Series("is_fraud", ml_labels, dtype=pl.Int32))
-        )
+    if ml_ids.height > 0:
+            if ml_proba is None:
+                raise ValueError(
+                    f"ml_proba is None but {ml_ids.height} users were routed to SEND_TO_ML. "
+                    "Pass the model probabilities or re-check the rule filter."
+                )
+            ml_labels = (ml_proba >= best_threshold).astype(np.int32)
+            parts.append(
+                ml_ids.with_columns(pl.Series("is_fraud", ml_labels, dtype=pl.Int32))
+            )
 
     submission = pl.concat(parts).sort("id_user")
     print(
