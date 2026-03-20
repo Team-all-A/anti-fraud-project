@@ -46,13 +46,14 @@ class RuleConfig:
     w2_max_init_ratio: float = 0.10
     w2_max_fail_rate: float = 0.02
 
-    # For downstream ML on the ML-zone
-    drop_for_ml: list[str] = field(default_factory=lambda: [
-        "id_user",
-        "is_fraud",
-        "rule_decision",
-        "rule_triggers",
-    ])
+    # UNUSED. Main duplicates this but I will leave it here for better times
+    # For downstream ML on the ML-zone 
+    # drop_for_ml: list[str] = field(default_factory=lambda: [
+    #     "id_user",
+    #     "is_fraud",
+    #     "rule_decision",
+    #     "rule_triggers",
+    # ])
 
 
 def _parse_datetime_col(df: pl.DataFrame, col: str) -> pl.DataFrame:
@@ -395,6 +396,9 @@ def build_flat_user_dataset(df: pl.DataFrame, is_train: bool = True) -> pl.DataF
     ]
     if numeric_fill:
         out = out.with_columns(numeric_fill)
+    
+    if "timestamp_reg" in out.columns:
+        out = out.drop("timestamp_reg")
 
     return build_risk_indicators(out)
 
@@ -558,7 +562,7 @@ def prepare_ml_zone(
     Return ML-zone only.
     This is what you should feed into LightGBM / sklearn afterwards.
     """
-    
+
     if cfg is None:
         cfg = RuleConfig()
 

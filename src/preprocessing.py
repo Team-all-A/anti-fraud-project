@@ -56,9 +56,6 @@ class PolarsImputer(BaseEstimator, TransformerMixin):
       numeric → median of training fold
       string  → "unknown"
       boolean → False
-
-    Raw datetime columns are skipped (their numeric decompositions are handled
-    by PolarsDatetimeParser before this step runs).
     """
 
     def __init__(
