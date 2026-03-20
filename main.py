@@ -166,11 +166,31 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(y)), y), star
     oof_proba[val_idx] = model.predict_proba(X_val_pd)[:, 1]
     test_proba        += model.predict_proba(X_test_pd)[:, 1] / N_SPLITS
 
-    fold_f1 = f1_score(y_val_fold, (oof_proba[val_idx] >= 0.5).astype(int), zero_division=0)
-    fold_f1s.append(fold_f1)
-    print(f"  Fold {fold}: F1 @ 0.50 = {fold_f1:.4f} | fraud {y_val_fold.sum()}/{len(y_val_fold)}")
+    from sklearn.metrics import roc_auc_score
+    val_proba = oof_proba[val_idx]
+    fold_auc  = roc_auc_score(y_val_fold, val_proba)
+    fold_f1s.append(fold_auc)
+    print(
+        f"  Fold {fold}: AUC={fold_auc:.4f} | "
+        f"proba min={val_proba.min():.3f} mean={val_proba.mean():.3f} max={val_proba.max():.3f} | "
+        f"fraud {y_val_fold.sum()}/{len(y_val_fold)}"
+    )
 
-print(f"\nCV mean F1: {np.mean(fold_f1s):.4f} ± {np.std(fold_f1s):.4f}")
+print(f"\nCV mean AUC: {np.mean(fold_f1s):.4f} ± {np.std(fold_f1s):.4f}")
+
+# ── Аналіз розподілу ймовірностей ─────────────────────────────────────────────
+print("\nOOF Probability distribution:")
+print(f"  Min:    {oof_proba.min():.5f}")
+print(f"  Median: {np.median(oof_proba):.5f}")
+print(f"  Mean:   {oof_proba.mean():.5f}")
+print(f"  90th %: {np.percentile(oof_proba, 90):.5f}")
+print(f"  95th %: {np.percentile(oof_proba, 95):.5f}")
+print(f"  99th %: {np.percentile(oof_proba, 99):.5f}")
+print(f"  Max:    {oof_proba.max():.5f}")
+
+fraud_mask = (y == 1)
+print(f"\n  Mean proba for FRAUD (y=1): {oof_proba[fraud_mask].mean():.5f}")
+print(f"  Mean proba for LEGIT (y=0): {oof_proba[~fraud_mask].mean():.5f}")
 
 
 # ── 8. Threshold optimisation on OOF predictions ─────────────────────────────
