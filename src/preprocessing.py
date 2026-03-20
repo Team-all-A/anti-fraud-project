@@ -5,12 +5,7 @@ from pathlib import Path
 import polars as pl
 from sklearn.base import BaseEstimator, TransformerMixin
 
-
-# Columns that are identifiers / raw personal fields and should not become
-# direct model features later.
 ID_COLS = ["id_user", "card_mask_hash", "card_holder", "email"]
-
-# Raw datetime columns expected in the source files.
 DATE_COLS = ["timestamp_tr", "timestamp_reg"]
 
 NUMERIC_DTYPES = {
@@ -49,14 +44,8 @@ def load_and_merge(transaction_path: str, users_path: str) -> pl.DataFrame:
     if not users_path.exists():
         raise FileNotFoundError(f"Users file not found: {users_path}")
 
-    transactions = pl.read_csv(
-        transaction_path,
-        infer_schema_length=10_000,
-    )
-    users = pl.read_csv(
-        users_path,
-        infer_schema_length=10_000,
-    )
+    transactions = pl.read_csv(transaction_path, infer_schema_length=10_000,)
+    users = pl.read_csv(users_path, infer_schema_length=10_000,)
 
     _validate_required_columns(transactions, ["id_user"], "transactions")
     _validate_required_columns(users, ["id_user"], "users")
