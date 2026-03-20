@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import numpy as np
 import polars as pl
 
@@ -45,15 +45,6 @@ class RuleConfig:
     w2_min_recurring: int = 10
     w2_max_init_ratio: float = 0.10
     w2_max_fail_rate: float = 0.02
-
-    # UNUSED. Main duplicates this but I will leave it here for better times
-    # For downstream ML on the ML-zone 
-    # drop_for_ml: list[str] = field(default_factory=lambda: [
-    #     "id_user",
-    #     "is_fraud",
-    #     "rule_decision",
-    #     "rule_triggers",
-    # ])
 
 
 def _parse_datetime_col(df: pl.DataFrame, col: str) -> pl.DataFrame:
@@ -555,30 +546,20 @@ def apply_rule_based_filter(
 
 def prepare_ml_zone(
     df: pl.DataFrame,
-    cfg: RuleConfig | None = None,
     is_train: bool = True,
 ) -> tuple[pl.DataFrame, np.ndarray | None]:
     """
     Return ML-zone only.
     This is what you should feed into LightGBM / sklearn afterwards.
     """
-
-    if cfg is None:
-        cfg = RuleConfig()
-
     ml_df = df.filter(pl.col("rule_decision") == "SEND_TO_ML")
 
     if ml_df.height == 0:
-        return ml_df, None
+            return ml_df, None
 
     y = None
     if is_train and "is_fraud" in ml_df.columns:
-        # 1. Спочатку зберігаємо цільову змінну
         y = ml_df.get_column("is_fraud").to_numpy()
-
-    # 2. Потім видаляємо зайві колонки згідно з конфігурацією
-    drop_cols = [c for c in cfg.drop_for_ml if c in ml_df.columns]
-    ml_df = ml_df.drop(drop_cols)
 
     return ml_df, y
 
