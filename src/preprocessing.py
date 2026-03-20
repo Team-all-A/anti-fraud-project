@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import polars as pl
+import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 
-ID_COLS = ["id_user", "card_mask_hash", "card_holder", "email"]
+
+ID_COLS   = ["id_user", "card_mask_hash", "card_holder", "email"]
 DATE_COLS = ["timestamp_tr", "timestamp_reg"]
 
 NUMERIC_DTYPES = {
@@ -15,77 +17,65 @@ NUMERIC_DTYPES = {
 }
 
 
-def _validate_required_columns(df: pl.DataFrame, required: list[str], df_name: str) -> None:
-    missing = [col for col in required if col not in df.columns]
-    if missing:
-        raise ValueError(
-            f"{df_name} is missing required columns: {missing}. "
-            f"Available columns: {df.columns}"
-        )
-
+# ── Loader ────────────────────────────────────────────────────────────────────
 
 def load_and_merge(transaction_path: str, users_path: str) -> pl.DataFrame:
-    """
-    Load users and transactions, then merge them by user id.
+    tx_path   = Path(transaction_path)
+    usr_path  = Path(users_path)
 
-    Important design choice:
-    we keep a LEFT join from users to transactions so every user remains in the
-    dataset even if they have no transactions. This matches the current project
-    structure, where user metadata is the base table and transactions expand it.
+    if not tx_path.exists():
+        raise FileNotFoundError(f"Transactions not found: {tx_path}")
+    if not usr_path.exists():
+        raise FileNotFoundError(f"Users not found: {usr_path}")
 
-    Returns:
-        Polars DataFrame containing one row per joined user-transaction record.
-    """
-    transaction_path = Path(transaction_path)
-    users_path = Path(users_path)
+    transactions = pl.read_csv(tx_path,  infer_schema_length=10_000)
+    users        = pl.read_csv(usr_path, infer_schema_length=10_000)
 
-    if not transaction_path.exists():
-        raise FileNotFoundError(f"Transactions file not found: {transaction_path}")
-    if not users_path.exists():
-        raise FileNotFoundError(f"Users file not found: {users_path}")
+    for df, name, col in [(transactions, "transactions", "id_user"),
+                          (users,        "users",        "id_user")]:
+        if col not in df.columns:
+            raise ValueError(f"{name} is missing required column '{col}'")
 
-    transactions = pl.read_csv(transaction_path, infer_schema_length=10_000,)
-    users = pl.read_csv(users_path, infer_schema_length=10_000,)
-
-    _validate_required_columns(transactions, ["id_user"], "transactions")
-    _validate_required_columns(users, ["id_user"], "users")
-
-    # Defensive deduplication of user table.
-    # If duplicate users exist, the join can explode unexpectedly.
+    # Deduplicate users defensively to prevent accidental row explosion on join.
     if users.get_column("id_user").is_duplicated().any():
         users = users.unique(subset=["id_user"], keep="first")
 
-    df = users.join(transactions, on="id_user", how="left")
-    return df
+    return users.join(transactions, on="id_user", how="left")
 
+
+# ── Datetime parser (stateless) ───────────────────────────────────────────────
 
 class PolarsDatetimeParser(BaseEstimator, TransformerMixin):
     """
-    Parse raw datetime columns and add simple calendar features.
+    Parse raw datetime strings into Polars Datetime and add calendar columns.
 
-    This transformer is stateless, so it is safe to use before splitting logic
-    as long as it only performs row-wise parsing. In our project it still runs
-    inside the fold pipeline for consistency.
+    Stateless — safe to call globally before any fold split.
     """
 
-    def __init__(self, date_cols: list[str]):
-        self.date_cols = date_cols
+    def __init__(self, date_cols: list[str] = None):
+        self.date_cols = date_cols or DATE_COLS
 
     def fit(self, X: pl.DataFrame, y=None):
         return self
 
-    def _parse_datetime_column(self, df: pl.DataFrame, col: str) -> pl.DataFrame:
+    def transform(self, X: pl.DataFrame) -> pl.DataFrame:
+        df = X.clone()
+        for col in self.date_cols:
+            df = self._parse_col(df, col)
+        return df
+
+    def _parse_col(self, df: pl.DataFrame, col: str) -> pl.DataFrame:
         if col not in df.columns:
             return df
 
         dtype = df.schema[col]
 
         if dtype == pl.Datetime:
-            parsed_expr = pl.col(col).dt.replace_time_zone(None).alias(col)
+            parsed = pl.col(col).dt.replace_time_zone(None).alias(col)
         elif dtype == pl.Date:
-            parsed_expr = pl.col(col).cast(pl.Datetime).alias(col)
+            parsed = pl.col(col).cast(pl.Datetime).alias(col)
         else:
-            parsed_expr = (
+            parsed = (
                 pl.col(col)
                 .cast(pl.Utf8, strict=False)
                 .str.strip_chars()
@@ -94,15 +84,11 @@ class PolarsDatetimeParser(BaseEstimator, TransformerMixin):
                 .alias(col)
             )
 
-        df = df.with_columns(parsed_expr)
+        df = df.with_columns([
+            parsed,
+            pl.col(col).is_null().cast(pl.Int8).alias(f"{col}_is_missing"),
+        ])
 
-        # Add a missingness flag because "date absent" can itself be informative.
-        # Keep it generic here; downstream feature engineering may use it.
-        df = df.with_columns(
-            pl.col(col).is_null().cast(pl.Int8).alias(f"{col}_is_missing")
-        )
-
-        # Calendar decomposition. These are safe row-level features.
         df = df.with_columns([
             pl.col(col).dt.year().alias(f"{col}_year"),
             pl.col(col).dt.month().alias(f"{col}_month"),
@@ -113,61 +99,51 @@ class PolarsDatetimeParser(BaseEstimator, TransformerMixin):
 
         return df
 
-    def transform(self, X: pl.DataFrame) -> pl.DataFrame:
-        df = X.clone()
 
-        for col in self.date_cols:
-            df = self._parse_datetime_column(df, col)
-
-        return df
-
+# ── Imputer (stateful — fit on train fold only) ───────────────────────────────
 
 class PolarsImputer(BaseEstimator, TransformerMixin):
     """
-    Fold-safe imputer.
+    Fold-safe median/constant imputer.
 
-    fit():
-        learns fill values from the training fold only
-
-    transform():
-        applies those values to validation / test / inference data
+    fit()      — learns fill values from the training fold only.
+    transform() — applies those values to any split (val, test, inference).
 
     Strategy:
-    - numeric columns -> median
-    - string columns  -> "unknown"
-    - boolean columns -> False
+      numeric → median of training fold
+      string  → "unknown"
+      boolean → False
 
-    Raw datetime columns are intentionally left nullable.
-    Their derived numeric components are handled by numeric imputation after
-    PolarsDatetimeParser runs.
+    Raw datetime columns are skipped (their numeric decompositions are handled
+    by PolarsDatetimeParser before this step runs).
     """
 
     def __init__(
         self,
-        string_fill_value: str = "unknown",
-        bool_fill_value: bool = False,
+        string_fill:  str  = "unknown",
+        bool_fill:    bool = False,
         exclude_cols: list[str] | None = None,
     ):
-        self.string_fill_value = string_fill_value
-        self.bool_fill_value = bool_fill_value
-        self.exclude_cols = exclude_cols if exclude_cols is not None else ["id_user"]
+        self.string_fill  = string_fill
+        self.bool_fill    = bool_fill
+        self.exclude_cols = set(exclude_cols or ["id_user"])
 
-        self.numeric_fill_values_: dict[str, float | int] = {}
-        self.string_cols_: list[str] = []
-        self.bool_cols_: list[str] = []
+        self.numeric_fills_: dict[str, float | int] = {}
+        self.string_cols_:   list[str] = []
+        self.bool_cols_:     list[str] = []
 
     def fit(self, X: pl.DataFrame, y=None):
-        self.numeric_fill_values_ = {}
-        self.string_cols_ = []
-        self.bool_cols_ = []
+        self.numeric_fills_ = {}
+        self.string_cols_   = []
+        self.bool_cols_     = []
 
         for col, dtype in zip(X.columns, X.dtypes):
             if col in self.exclude_cols:
                 continue
 
             if dtype in NUMERIC_DTYPES:
-                median_value = X.get_column(col).median()
-                self.numeric_fill_values_[col] = 0 if median_value is None else median_value
+                median = X.get_column(col).median()
+                self.numeric_fills_[col] = 0 if median is None else median
 
             elif dtype == pl.Utf8:
                 self.string_cols_.append(col)
@@ -180,47 +156,118 @@ class PolarsImputer(BaseEstimator, TransformerMixin):
     def transform(self, X: pl.DataFrame) -> pl.DataFrame:
         df = X.clone()
 
-        # Normalize strings a bit before filling:
-        # trim whitespace, convert empty strings to null, then fill with default.
+        # Strings: strip whitespace, treat empty as null, fill with constant.
         string_exprs = []
         for col in self.string_cols_:
-            if col in df.columns:
-                string_exprs.append(
-                    pl.when(
-                        pl.col(col)
-                        .cast(pl.Utf8, strict=False)
-                        .str.strip_chars()
-                        .eq("")
-                    )
-                    .then(None)
-                    .otherwise(
-                        pl.col(col).cast(pl.Utf8, strict=False).str.strip_chars()
-                    )
-                    .fill_null(self.string_fill_value)
-                    .alias(col)
-                )
-
+            if col not in df.columns:
+                continue
+            clean = pl.col(col).cast(pl.Utf8, strict=False).str.strip_chars()
+            string_exprs.append(
+                pl.when(clean.eq(""))
+                .then(None)
+                .otherwise(clean)
+                .fill_null(self.string_fill)
+                .alias(col)
+            )
         if string_exprs:
             df = df.with_columns(string_exprs)
 
-        bool_exprs = []
-        for col in self.bool_cols_:
-            if col in df.columns:
-                bool_exprs.append(
-                    pl.col(col).fill_null(self.bool_fill_value).alias(col)
-                )
-
+        # Booleans.
+        bool_exprs = [
+            pl.col(col).fill_null(self.bool_fill).alias(col)
+            for col in self.bool_cols_
+            if col in df.columns
+        ]
         if bool_exprs:
             df = df.with_columns(bool_exprs)
 
-        numeric_exprs = []
-        for col, fill_value in self.numeric_fill_values_.items():
-            if col in df.columns:
-                numeric_exprs.append(
-                    pl.col(col).fill_null(fill_value).alias(col)
-                )
-
+        # Numerics: fill with per-column medians learned from train.
+        numeric_exprs = [
+            pl.col(col).fill_null(fill).alias(col)
+            for col, fill in self.numeric_fills_.items()
+            if col in df.columns
+        ]
         if numeric_exprs:
             df = df.with_columns(numeric_exprs)
 
         return df
+
+
+# ── Model frame converter ─────────────────────────
+
+class PolarsToModelFrame(BaseEstimator, TransformerMixin):
+    """
+    Convert a Polars DataFrame into a stable pandas DataFrame for LightGBM.
+
+    fit()      — records the ordered list of numeric feature columns from X_train.
+    transform() — enforces that exact column set and order on any split.
+                  Missing columns are filled with 0, extra columns are dropped.
+
+    Why pandas output:
+    - LightGBM preserves feature names from pandas DataFrames.
+    - Avoids the LightGBM warning about invalid feature name characters.
+    """
+
+    NUMERIC_DTYPES = {
+        pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+        pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+        pl.Float32, pl.Float64,
+    }
+
+    def __init__(self, drop_cols: list[str] | None = None):
+        self.drop_cols = drop_cols if drop_cols is not None else list(ID_COLS)
+        self.feature_names_: list[str] = []
+
+    def _prepare(self, X: pl.DataFrame) -> pl.DataFrame:
+        df = X.clone()
+
+        # Drop identifier columns.
+        to_drop = [c for c in self.drop_cols if c in df.columns]
+        if to_drop:
+            df = df.drop(to_drop)
+
+        # Cast booleans to Int8.
+        bool_cols = [c for c, t in zip(df.columns, df.dtypes) if t == pl.Boolean]
+        if bool_cols:
+            df = df.with_columns([pl.col(c).cast(pl.Int8) for c in bool_cols])
+
+        # Keep numeric columns only.
+        df = df.select([c for c, t in zip(df.columns, df.dtypes) if t in self.NUMERIC_DTYPES])
+
+        # Replace NaN / Inf with null, then fill all nulls with 0.
+        float_cols = [c for c, t in zip(df.columns, df.dtypes) if t in (pl.Float32, pl.Float64)]
+        if float_cols:
+            df = df.with_columns([
+                pl.when(pl.col(c).is_nan() | pl.col(c).is_infinite())
+                .then(None)
+                .otherwise(pl.col(c))
+                .alias(c)
+                for c in float_cols
+            ])
+
+        if df.width > 0:
+            df = df.with_columns([pl.col(c).fill_null(0) for c in df.columns])
+
+        return df
+
+    def fit(self, X: pl.DataFrame, y=None):
+        self.feature_names_ = self._prepare(X).columns
+        return self
+
+    def transform(self, X: pl.DataFrame) -> pd.DataFrame:
+        df = self._prepare(X)
+
+        # Add any columns seen in training but missing here (e.g. rare categories).
+        missing = [c for c in self.feature_names_ if c not in df.columns]
+        if missing:
+            df = df.with_columns([pl.lit(0.0).alias(c) for c in missing])
+
+        # Drop columns not seen during training.
+        extra = [c for c in df.columns if c not in self.feature_names_]
+        if extra:
+            df = df.drop(extra)
+
+        # Enforce training column order.
+        df = df.select(self.feature_names_)
+
+        return pd.DataFrame(df.to_dict(as_series=False), columns=self.feature_names_)
