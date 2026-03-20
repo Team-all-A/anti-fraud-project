@@ -8,9 +8,8 @@ from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
 
 from src.business import optimize_threshold
-from src.features import PolarsTargetEncoder
 from src.model import get_model, run_optuna
-from src.preprocessing import PolarsImputer, PolarsToModelFrame, load_and_merge
+from src.preprocessing import PolarsImputer, PolarsToModelFrame, PolarsTargetEncoder, load_and_merge
 from src.rule_based_filter import (
     apply_rule_based_filter,
     build_flat_user_dataset,

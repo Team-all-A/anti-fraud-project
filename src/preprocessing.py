@@ -4,6 +4,7 @@ from pathlib import Path
 
 import polars as pl
 import pandas as pd
+import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
 
 
@@ -213,3 +214,113 @@ class PolarsToModelFrame(BaseEstimator, TransformerMixin):
         df = df.select(self.feature_names_)
 
         return pd.DataFrame(df.to_dict(as_series=False), columns=self.feature_names_)
+    
+
+# ── Target encoding (stateful) ────────────────────────────────────────
+
+class PolarsTargetEncoder(BaseEstimator, TransformerMixin):
+    """
+    Smoothed target encoder.
+
+    WHEN TO CALL: inside each fold, after imputation.
+
+    fit_transform(X_train, y_train)
+        Learns category → fraud-rate mapping from train.
+        Uses leave-one-out encoding for train rows so a row does not encode itself.
+
+    transform(X_val)
+        Applies the stored mapping (learned from train) to val/test.
+        Unseen categories fall back to global_mean_.
+
+    Call order inside fold:
+        1. PolarsImputer.fit(X_train)
+        2. PolarsImputer.transform(X_train), transform(X_val)
+        3. PolarsTargetEncoder.fit_transform(X_train, y_train)   ← LOO on train
+        4. PolarsTargetEncoder.transform(X_val)                  ← plain lookup
+    """
+
+    def __init__(
+        self,
+        cat_cols:     list[str],
+        smoothing:    float = 20.0,
+        drop_original: bool = True,
+    ):
+        self.cat_cols      = cat_cols
+        self.smoothing     = smoothing
+        self.drop_original = drop_original
+
+        self.global_mean_: float = 0.0
+        self.mappings_: dict[str, pl.DataFrame] = {}
+
+    def fit(self, X: pl.DataFrame, y: np.ndarray):
+        self.global_mean_ = float(np.mean(y)) if len(y) > 0 else 0.0
+        self.mappings_ = {}
+
+        df = X.with_columns(pl.Series("__target", y))
+
+        for col in self.cat_cols:
+            if col not in df.columns:
+                continue
+
+            stats = df.group_by(col).agg([
+                pl.col("__target").sum().alias("__sum"),
+                pl.len().alias("__count"),
+            ])
+
+            self.mappings_[col] = stats.with_columns(
+                ((pl.col("__sum") + self.smoothing * self.global_mean_) /
+                 (pl.col("__count") + self.smoothing))
+                .alias(f"{col}_target_enc")
+            ).select([col, f"{col}_target_enc"])
+
+        return self
+
+    def fit_transform(self, X: pl.DataFrame, y: np.ndarray) -> pl.DataFrame:
+        """LOO encoding for train: each row excludes itself from its category mean."""
+        self.fit(X, y)
+
+        df = X.with_columns(pl.Series("__target", y))
+
+        for col in self.cat_cols:
+            if col not in df.columns:
+                continue
+
+            stats = df.group_by(col).agg([
+                pl.col("__target").sum().alias(f"__{col}_sum"),
+                pl.len().alias(f"__{col}_count"),
+            ])
+            df = df.join(stats, on=col, how="left")
+
+            df = df.with_columns(
+                pl.when(pl.col(f"__{col}_count") > 1)
+                .then(
+                    ((pl.col(f"__{col}_sum") - pl.col("__target")) +
+                     self.smoothing * self.global_mean_) /
+                    ((pl.col(f"__{col}_count") - 1) + self.smoothing)
+                )
+                .otherwise(self.global_mean_)
+                .alias(f"{col}_target_enc")
+            )
+
+            drop = [f"__{col}_sum", f"__{col}_count"]
+            if self.drop_original:
+                drop.append(col)
+            df = df.drop(drop)
+
+        return df.drop("__target")
+
+    def transform(self, X: pl.DataFrame) -> pl.DataFrame:
+        df = X.clone()
+
+        for col in self.cat_cols:
+            if col not in df.columns or col not in self.mappings_:
+                continue
+
+            enc_col = f"{col}_target_enc"
+            df = df.join(self.mappings_[col], on=col, how="left")
+            df = df.with_columns(pl.col(enc_col).fill_null(self.global_mean_).alias(enc_col))
+
+            if self.drop_original:
+                df = df.drop(col)
+
+        return df
