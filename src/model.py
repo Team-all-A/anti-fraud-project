@@ -5,34 +5,87 @@ import lightgbm as lgb
 from lightgbm import LGBMClassifier
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.metrics import f1_score
-from sklearn.model_selection import StratifiedKFold
-
-try:
-    import optuna
-except Exception:
-    optuna = None
 
 
 RANDOM_STATE = 42
 
 
-def find_best_threshold(y_true: np.ndarray, probs: np.ndarray) -> tuple[float, float]:
-    best_f1, best_thr = 0.0, 0.5
-    for thr in np.arange(0.05, 0.95, 0.01):
-        score = f1_score(y_true, (probs >= thr).astype(int), zero_division=0)
+def find_best_threshold(
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    start: float = 0.05,
+    stop: float = 0.95,
+    step: float = 0.01,
+) -> tuple[float, float]:
+    """
+    Search for the threshold that maximizes F1.
+
+    Returns:
+        best_f1, best_threshold
+    """
+    best_f1 = 0.0
+    best_thr = 0.5
+
+    for thr in np.arange(start, stop, step):
+        preds = (probs >= thr).astype(int)
+        score = f1_score(y_true, preds, zero_division=0)
         if score > best_f1:
-            best_f1, best_thr = float(score), float(thr)
+            best_f1 = float(score)
+            best_thr = float(thr)
+
     return best_f1, best_thr
 
 
+def compute_scale_pos_weight(y: np.ndarray) -> float:
+    """
+    Compute class imbalance weight from the training labels only.
+    """
+    y = np.asarray(y)
+    positives = int(np.sum(y == 1))
+    negatives = int(np.sum(y == 0))
+
+    if positives == 0:
+        return 1.0
+
+    return max(1.0, negatives / positives)
+
+
 class FraudLGBMClassifier(BaseEstimator, ClassifierMixin):
-    def __init__(self, lgbm_params: dict | None = None, threshold: float = 0.5):
+    """
+    sklearn-compatible LightGBM wrapper from the ML engineer's approach.
+
+    Why this fits your current project:
+    - works inside sklearn Pipeline
+    - supports predict_proba()
+    - supports custom threshold via predict()
+    - keeps LightGBM config centralized
+    """
+
+    def __init__(
+        self,
+        lgbm_params: dict | None = None,
+        threshold: float = 0.5,
+        use_early_stopping: bool = False,
+        early_stopping_rounds: int = 50,
+    ):
         self.lgbm_params = lgbm_params or {}
         self.threshold = threshold
+        self.use_early_stopping = use_early_stopping
+        self.early_stopping_rounds = early_stopping_rounds
 
     def fit(self, X, y, eval_set=None):
+        """
+        Fit underlying LightGBM model.
+
+        Note:
+        In your current Pipeline-based architecture, eval_set is usually not used,
+        because validation data would need to be transformed by the same pipeline
+        first. So this wrapper supports it, but your current main flow does not
+        rely on it.
+        """
         params = {
             "objective": "binary",
+            "boosting_type": "gbdt",
             "n_jobs": -1,
             "verbose": -1,
             "random_state": RANDOM_STATE,
@@ -41,105 +94,78 @@ class FraudLGBMClassifier(BaseEstimator, ClassifierMixin):
 
         self.model_ = LGBMClassifier(**params)
         self.classes_ = np.array([0, 1])
-        self.threshold_ = self.threshold
+        self.threshold_ = float(self.threshold)
 
         fit_kwargs = {}
-        if eval_set is not None:
-            fit_kwargs = {
-                "eval_set": eval_set,
-                "callbacks": [lgb.early_stopping(50, verbose=False)],
-            }
+
+        if self.use_early_stopping and eval_set is not None:
+            fit_kwargs["eval_set"] = eval_set
+            fit_kwargs["callbacks"] = [
+                lgb.early_stopping(self.early_stopping_rounds, verbose=False)
+            ]
 
         self.model_.fit(X, y, **fit_kwargs)
-
-        best_iter = getattr(self.model_, "best_iteration_", None)
-        self.best_iteration_ = int(best_iter) if best_iter is not None and best_iter > 0 else None
         return self
 
     def predict_proba(self, X):
-        if getattr(self, "best_iteration_", None) is not None:
-            return self.model_.predict_proba(X, num_iteration=self.best_iteration_)
         return self.model_.predict_proba(X)
 
     def predict(self, X):
         return (self.predict_proba(X)[:, 1] >= self.threshold_).astype(int)
 
     def tune_threshold(self, X_val, y_val) -> tuple[float, float]:
+        """
+        Tune decision threshold on a validation set.
+
+        Returns:
+            best_threshold, best_f1
+        """
         probs = self.predict_proba(X_val)[:, 1]
         best_f1, best_thr = find_best_threshold(y_val, probs)
         self.threshold_ = best_thr
-        return best_f1, best_thr
+        return best_thr, best_f1
 
 
-def default_params(scale_pos_weight: float | None = None) -> dict:
-    params = {
-        "n_estimators": 500,
-        "learning_rate": 0.05,
-        "num_leaves": 31,
-        "max_depth": 7,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "min_child_samples": 20,
-        "reg_alpha": 0.0,
-        "reg_lambda": 0.0,
-    }
-    if scale_pos_weight is not None:
-        params["scale_pos_weight"] = scale_pos_weight
-    return params
-
-
-def suggest_scale_pos_weight(y: np.ndarray) -> float:
-    y = np.asarray(y)
-    pos = int((y == 1).sum())
-    neg = int((y == 0).sum())
-    return float(neg / max(pos, 1))
-
-
-def run_optuna(
-    X_train,
-    y_train: np.ndarray,
-    n_splits: int = 5,
-    n_trials: int = 50,
-    random_state: int = RANDOM_STATE,
-) -> dict:
-    if optuna is None:
-        raise ImportError("optuna is not installed. Install it or disable tuning.")
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-    def objective(trial):
-        params = {
-            "n_estimators": trial.suggest_int("n_estimators", 200, 1000),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 20, 200),
-            "max_depth": trial.suggest_int("max_depth", 4, 10),
-            "min_child_samples": trial.suggest_int("min_child_samples", 10, 100),
-            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 5.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 5.0, log=True),
-            "scale_pos_weight": trial.suggest_float("scale_pos_weight", 1.0, 30.0),
-        }
-
-        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-        scores: list[float] = []
-
-        for tr_idx, vl_idx in cv.split(X_train, y_train):
-            X_tr = X_train.iloc[tr_idx] if hasattr(X_train, "iloc") else X_train[tr_idx]
-            X_vl = X_train.iloc[vl_idx] if hasattr(X_train, "iloc") else X_train[vl_idx]
-
-            clf = FraudLGBMClassifier(lgbm_params=params)
-            clf.fit(X_tr, y_train[tr_idx], eval_set=[(X_vl, y_train[vl_idx])])
-            clf.tune_threshold(X_vl, y_train[vl_idx])
-            preds = clf.predict(X_vl)
-            scores.append(f1_score(y_train[vl_idx], preds, zero_division=0))
-
-        return float(np.mean(scores))
-
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=random_state),
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=3),
+def get_default_lgbm_params(y_train: np.ndarray | None = None) -> dict:
+    """
+    Default LightGBM params adapted from your earlier project setup,
+    but wrapped into the ML engineer's model class.
+    """
+    scale_pos_weight = (
+        compute_scale_pos_weight(y_train)
+        if y_train is not None
+        else 1.0
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-    return dict(study.best_params)
+
+    return {
+        "n_estimators": 700,
+        "learning_rate": 0.03,
+        "num_leaves": 31,
+        "max_depth": -1,
+        "min_child_samples": 40,
+        "subsample": 0.8,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.5,
+        "reg_lambda": 1.0,
+        "scale_pos_weight": scale_pos_weight,
+    }
+
+
+def get_model(
+    y_train: np.ndarray | None = None,
+    threshold: float = 0.5,
+) -> FraudLGBMClassifier:
+    """
+    Factory used by your existing main.py and pipeline.py.
+
+    This keeps your current architecture unchanged.
+    """
+    params = get_default_lgbm_params(y_train)
+
+    return FraudLGBMClassifier(
+        lgbm_params=params,
+        threshold=threshold,
+        use_early_stopping=False,
+        early_stopping_rounds=50,
+    )
