@@ -8,7 +8,7 @@ import optuna
 import polars as pl
 from lightgbm import LGBMClassifier
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 
@@ -196,10 +196,8 @@ def run_optuna(
 
             clf = FraudLGBMClassifier(lgbm_params=params)
             clf.fit(X_train_pd, y_train_fold, eval_set=[(X_val_pd, y_val_fold)])
-            clf.tune_threshold(X_val_pd, y_val_fold)
-
-            fold_f1 = f1_score(y_val_fold, clf.predict(X_val_pd), zero_division=0)
-            scores.append(fold_f1)
+            
+            scores.append(roc_auc_score(y_val_fold, clf.predict_proba(X_val_pd)[:, 1]))
 
         return float(np.mean(scores))
 
@@ -210,7 +208,7 @@ def run_optuna(
     )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
-    print(f"\nOptuna best CV F1 : {study.best_value:.4f}")
+    print(f"\nOptuna best CV AUC : {study.best_value:.4f}")
     print(f"Best params       : {study.best_params}")
 
     return study.best_params

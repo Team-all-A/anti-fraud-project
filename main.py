@@ -72,8 +72,8 @@ test_filtered  = apply_rule_based_filter(test_flat,  verbose=True)
 train_ml, y = prepare_ml_zone(train_filtered, is_train=True)
 test_ml,  _ = prepare_ml_zone(test_filtered,  is_train=False)
 
-X      = train_ml
-X_test = test_ml
+X      = train_ml.drop([TARGET_COL, "rule_decision", "rule_triggers"])
+X_test = test_ml.drop(["rule_decision", "rule_triggers"])
 
 print(f"\nML zone → {X.height} train users | {X_test.height} test users")
 print(f"Fraud rate in ML zone: {y.mean():.4f}")
