@@ -142,10 +142,6 @@ class PolarsToModelFrame(BaseEstimator, TransformerMixin):
     fit()      — records the ordered list of numeric feature columns from X_train.
     transform() — enforces that exact column set and order on any split.
                   Missing columns are filled with 0, extra columns are dropped.
-
-    Why pandas output:
-    - LightGBM preserves feature names from pandas DataFrames.
-    - Avoids the LightGBM warning about invalid feature name characters.
     """
 
     NUMERIC_DTYPES = {
@@ -161,20 +157,17 @@ class PolarsToModelFrame(BaseEstimator, TransformerMixin):
     def _prepare(self, X: pl.DataFrame) -> pl.DataFrame:
         df = X.clone()
 
-        # Drop identifier columns.
         to_drop = [c for c in self.drop_cols if c in df.columns]
         if to_drop:
             df = df.drop(to_drop)
 
-        # Cast booleans to Int8.
         bool_cols = [c for c, t in zip(df.columns, df.dtypes) if t == pl.Boolean]
         if bool_cols:
             df = df.with_columns([pl.col(c).cast(pl.Int8) for c in bool_cols])
 
-        # Keep numeric columns only.
+        # Keep numeric columns only (string cols handled by target encoder before this).
         df = df.select([c for c, t in zip(df.columns, df.dtypes) if t in self.NUMERIC_DTYPES])
 
-        # Replace NaN / Inf with null, then fill all nulls with 0.
         float_cols = [c for c, t in zip(df.columns, df.dtypes) if t in (pl.Float32, pl.Float64)]
         if float_cols:
             df = df.with_columns([
@@ -197,19 +190,15 @@ class PolarsToModelFrame(BaseEstimator, TransformerMixin):
     def transform(self, X: pl.DataFrame) -> pd.DataFrame:
         df = self._prepare(X)
 
-        # Add any columns seen in training but missing here (e.g. rare categories).
         missing = [c for c in self.feature_names_ if c not in df.columns]
         if missing:
             df = df.with_columns([pl.lit(0.0).alias(c) for c in missing])
 
-        # Drop columns not seen during training.
         extra = [c for c in df.columns if c not in self.feature_names_]
         if extra:
             df = df.drop(extra)
 
-        # Enforce training column order.
         df = df.select(self.feature_names_)
-
         return pd.DataFrame(df.to_dict(as_series=False), columns=self.feature_names_)
     
 

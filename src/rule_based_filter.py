@@ -378,6 +378,46 @@ def build_flat_user_dataset(df: pl.DataFrame, is_train: bool = True) -> pl.DataF
 
     temporal = temporal.drop(["_eur_sum", "_total", "_ts_max", "_ts_min"])
 
+    # ── Entity features (cross-user, target-free) ───────────────────────────
+    # Ці фічі описують "мережеві" патерни: скільки юзерів ділять одну картку,
+    # одного card_holder. Обчислюються тільки з tx (без is_fraud)
+    # тому безпечні глобально. Результат — числові колонки.
+
+    entity_parts: list[pl.DataFrame] = []
+
+    if "card_mask_hash" in tx.columns:
+        card_user_count = (
+            tx.group_by("card_mask_hash")
+            .agg(pl.col("id_user").n_unique().alias("_users_per_card"))
+        )
+        user_card_entity = (
+            tx.select(["id_user", "card_mask_hash"])
+            .unique()
+            .join(card_user_count, on="card_mask_hash", how="left")
+            .group_by("id_user")
+            .agg([
+                pl.col("_users_per_card").max().alias("max_users_per_card"),
+                (pl.col("_users_per_card") > 1).any().cast(pl.Int8).alias("has_shared_card"),
+            ])
+        )
+        entity_parts.append(user_card_entity)
+
+    if "card_holder" in tx.columns:
+        holder_user_count = (
+            tx.filter(pl.col("card_holder").is_not_null())
+            .group_by("card_holder")
+            .agg(pl.col("id_user").n_unique().alias("_users_per_holder"))
+        )
+        user_holder_entity = (
+            tx.filter(pl.col("card_holder").is_not_null())
+            .select(["id_user", "card_holder"])
+            .unique()
+            .join(holder_user_count, on="card_holder", how="left")
+            .group_by("id_user")
+            .agg(pl.col("_users_per_holder").max().alias("max_users_per_holder"))
+        )
+        entity_parts.append(user_holder_entity)
+
     # ── Join all parts ──────────────────────────────────────────────────────
     out = (
         user_static
@@ -387,6 +427,9 @@ def build_flat_user_dataset(df: pl.DataFrame, is_train: bool = True) -> pl.DataF
         .join(card, on="id_user", how="left")
         .join(temporal, on="id_user", how="left")
     )
+
+    for entity_df in entity_parts:
+        out = out.join(entity_df, on="id_user", how="left")
 
     # Fill numeric nulls
     numeric_fill = [

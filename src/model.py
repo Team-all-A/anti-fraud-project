@@ -20,8 +20,10 @@ def find_best_threshold(
     probs: np.ndarray,
     n_steps: int = 300,
 ) -> tuple[float, float]:
+    # Шукаємо від p1 до max (не p99) — при стиснутих ймовірностях
+    # p99 може бути всього 0.033 при max=0.100, і оптимум поза діапазоном.
     p_min = float(np.percentile(probs, 1))
-    p_max = float(np.percentile(probs, 99))
+    p_max = float(probs.max())
 
     best_f1, best_thr = 0.0, (p_min + p_max) / 2
     for thr in np.linspace(p_min, p_max, n_steps):
@@ -57,15 +59,25 @@ class FraudLGBMClassifier(BaseEstimator, ClassifierMixin):
         self.early_stopping_rounds = early_stopping_rounds
 
     def fit(self, X, y, eval_set=None):
-        base_params = {
+        params = {
             "objective":     "binary",
             "boosting_type": "gbdt",
             "n_jobs":        -1,
             "verbose":       -1,
             "random_state":  RANDOM_STATE,
             "metric":        "auc",
+            # is_unbalance=True використовує внутрішній oversampling замість
+            # scale_pos_weight. Це дає кращу калібрацію ймовірностей при
+            # збереженні AUC, бо не штучно зміщує posterior.
+            "is_unbalance":  True,
         }
-        params = {**base_params, **self.lgbm_params}
+        # lgbm_params може містити scale_pos_weight з Optuna — видаляємо його,
+        # бо використовуємо is_unbalance замість нього.
+        lgbm_params_clean = {
+            k: v for k, v in self.lgbm_params.items()
+            if k != "scale_pos_weight"
+        }
+        params = {**params, **lgbm_params_clean}
         self.model_     = LGBMClassifier(**params)
         self.classes_   = np.array([0, 1])
         self.threshold_ = float(self.threshold)
@@ -131,26 +143,22 @@ def run_optuna(
     n_trials: int = 50,
     n_splits: int = 5,
 ) -> dict:
-    auto_spw = compute_scale_pos_weight(y)
-    # Range [auto*0.5, auto*1.5] дає найкращі результати (AUC=0.88, F1=0.27).
-    # Вищий SPW (44+) погіршує AUC до 0.82 — модель нестабільна при великому дисбалансі.
-    spw_lo   = max(10.0, auto_spw * 0.5)
-    spw_hi   = auto_spw * 1.5
-    print(f"  scale_pos_weight range: [{spw_lo:.1f}, {spw_hi:.1f}]  (auto={auto_spw:.1f})")
+    # is_unbalance=True вже в FraudLGBMClassifier.fit() — не потрібен SPW.
+    print(f"  Using is_unbalance=True (internal oversampling, no scale_pos_weight)")
 
     def objective(trial: optuna.Trial) -> float:
         params = {
-            "n_estimators":      trial.suggest_int("n_estimators", 300, 1500),
+            "n_estimators":      trial.suggest_int("n_estimators", 300, 2000),
             "learning_rate":     trial.suggest_float("learning_rate", 0.005, 0.1, log=True),
             "num_leaves":        trial.suggest_int("num_leaves", 31, 127),
             "max_depth":         trial.suggest_int("max_depth", 4, 9),
-            "min_child_samples": trial.suggest_int("min_child_samples", 5, 40),
+            "min_child_samples": trial.suggest_int("min_child_samples", 5, 60),
             "subsample":         trial.suggest_float("subsample", 0.6, 1.0),
             "subsample_freq":    1,
             "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.5, 1.0),
             "reg_alpha":         trial.suggest_float("reg_alpha",  1e-8, 2.0, log=True),
             "reg_lambda":        trial.suggest_float("reg_lambda", 1e-8, 2.0, log=True),
-            "scale_pos_weight":  trial.suggest_float("scale_pos_weight", spw_lo, spw_hi),
+            # scale_pos_weight прибрано — використовується is_unbalance=True
         }
 
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
