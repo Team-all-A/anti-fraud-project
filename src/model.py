@@ -20,7 +20,10 @@ def find_best_threshold(
     probs: np.ndarray,
     n_steps: int = 500,
 ) -> tuple[float, float]:
-    # p99 замість p_max — стійкіше до outliers у стиснутому діапазоні ймовірностей
+    """
+    Лінійний пошук порогу з максимальним F1.
+    p99 замість p_max — стійкіше до outliers у стиснутому діапазоні.
+    """
     p_min = float(np.percentile(probs, 1))
     p_max = float(np.percentile(probs, 99))
 
@@ -33,14 +36,40 @@ def find_best_threshold(
     return best_thr, best_f1
 
 
-def compute_scale_pos_weight(y: np.ndarray) -> float:
-    positives = int(np.sum(y == 1))
-    negatives = int(np.sum(y == 0))
-    if positives == 0:
-        return 1.0
-    ratio = negatives / positives
-    print(f"  neg/pos ratio: {negatives:,}/{positives:,} = {ratio:.1f}")
-    return max(1.0, ratio)
+def find_best_topk(
+    y_true: np.ndarray,
+    probs: np.ndarray,
+) -> tuple[int, float, float]:
+    """
+    Rank-based Top-K threshold.
+
+    Сортує юзерів за ймовірністю (desc) і знаходить K де F1 максимальний.
+    Не залежить від абсолютних значень proba — використовує AUC-ранжування напряму.
+    Повертає (best_k, best_f1, threshold) де threshold = proba K-го елемента.
+
+    Переважає find_best_threshold коли proba стиснуті в вузький діапазон
+    (наприклад [0.036–0.066]) — в цьому випадку абсолютний поріг нестабільний.
+    """
+    order     = np.argsort(probs)[::-1]
+    y_sorted  = y_true[order]
+    total_pos = int(y_true.sum())
+
+    best_f1, best_k = 0.0, 1
+    tp_cum = 0
+
+    for k in range(1, len(y_true) + 1):
+        tp_cum += int(y_sorted[k - 1])
+        prec = tp_cum / k
+        rec  = tp_cum / max(total_pos, 1)
+        f1   = 2 * prec * rec / max(prec + rec, 1e-9)
+        if f1 > best_f1:
+            best_f1 = float(f1)
+            best_k  = k
+
+    # Threshold = proba найнижчого елемента в топ-K
+    sorted_probas = probs[order]
+    threshold     = float(sorted_probas[best_k - 1])
+    return best_k, best_f1, threshold
 
 
 # ── Класифікатор ──────────────────────────────────────────────────────────────
@@ -68,19 +97,18 @@ class FraudLGBMClassifier(BaseEstimator, ClassifierMixin):
             # ніж scale_pos_weight який стискає ймовірності до prior
             "is_unbalance":  True,
         }
-        # Видаляємо scale_pos_weight і class_weight якщо прийшли ззовні
         lgbm_params_clean = {
             k: v for k, v in self.lgbm_params.items()
             if k not in ("scale_pos_weight", "is_unbalance", "class_weight")
         }
         params = {**params, **lgbm_params_clean}
-        self.model_ = LGBMClassifier(**params)
-        self.classes_ = np.array([0, 1])
+        self.model_     = LGBMClassifier(**params)
+        self.classes_   = np.array([0, 1])
         self.threshold_ = float(self.threshold)
 
         fit_kwargs: dict = {}
         if eval_set is not None:
-            fit_kwargs["eval_set"] = eval_set
+            fit_kwargs["eval_set"]  = eval_set
             fit_kwargs["callbacks"] = [
                 lgb.early_stopping(self.early_stopping_rounds, verbose=False),
             ]
@@ -102,7 +130,7 @@ class FraudLGBMClassifier(BaseEstimator, ClassifierMixin):
 
 # ── Дефолтні параметри ────────────────────────────────────────────────────────
 
-def get_default_lgbm_params(y_train: np.ndarray | None = None) -> dict:
+def get_default_lgbm_params() -> dict:
     return {
         "n_estimators":      1000,
         "learning_rate":     0.02,
@@ -122,7 +150,7 @@ def get_model(
     params: dict | None = None,
     threshold: float = 0.5,
 ) -> FraudLGBMClassifier:
-    lgbm_params = params if params is not None else get_default_lgbm_params(y_train)
+    lgbm_params = params if params is not None else get_default_lgbm_params()
     return FraudLGBMClassifier(lgbm_params=lgbm_params, threshold=threshold)
 
 
@@ -151,7 +179,7 @@ def run_optuna(
             "reg_lambda":        trial.suggest_float("reg_lambda",         1e-8,  5.0, log=True),
         }
 
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+        skf    = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
         scores: list[float] = []
 
         for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(y)), y)):
@@ -161,7 +189,7 @@ def run_optuna(
             clf = FraudLGBMClassifier(lgbm_params=params)
             clf.fit(X_train_pd, y[train_idx], eval_set=[(X_val_pd, y[val_idx])])
 
-            # AUC objective — threshold-незалежна, без leakage
+            # AUC objective — threshold-незалежна, без leakage через threshold
             auc = roc_auc_score(y[val_idx], clf.predict_proba(X_val_pd)[:, 1])
             scores.append(auc)
 

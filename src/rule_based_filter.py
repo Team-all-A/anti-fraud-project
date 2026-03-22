@@ -51,9 +51,11 @@ class RuleConfig:
     a3_fail_rate:   float = 0.50
 
     # A4: Висока fail_rate + незалежне підтвердження
-    a4_fail_rate:   float = 0.75
-    a4_fraud_count: int   = 5
-    a4_tds_count:   int   = 5
+    # Підняті пороги: precision=0.157 при 0.75/5/5 — 5579 FP, чистий шум.
+    # 0.95/15/15 → значно менше спрацьовувань, вища precision.
+    a4_fail_rate:   float = 0.95
+    a4_fraud_count: int   = 15
+    a4_tds_count:   int   = 15
 
     # A5: Критичний rule_score + значуща fail_rate
     a5_score:     int   = 4

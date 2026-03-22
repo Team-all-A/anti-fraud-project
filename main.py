@@ -4,10 +4,11 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
-from src.model import find_best_threshold, get_model, run_optuna
+from src.business import export_threshold_report
+from src.model import find_best_threshold, find_best_topk, get_model, run_optuna
 from src.preprocessing import (
     PolarsImputer,
     PolarsTargetEncoder,
@@ -28,14 +29,14 @@ TRAIN_USERS_PATH        = Path("data/train_users.csv")
 TEST_TRANSACTIONS_PATH  = Path("data/test_transactions.csv")
 TEST_USERS_PATH         = Path("data/test_users.csv")
 SUBMISSION_PATH         = Path("submission.csv")
+THRESHOLD_REPORT_PATH   = Path("threshold_report.csv")
 
 TARGET_COL   = "is_fraud"
 ID_COL       = "id_user"
 N_SPLITS     = 5
-N_TRIALS     = 50
+N_TRIALS     = 150      # збільшено з 50 — best trial був 43/50, простір не вичерпано
 RANDOM_STATE = 42
 
-# Multi-seed ensemble: кожен seed = окремий CV, фінал = середнє OOF
 ENSEMBLE_SEEDS = [42, 123, 456, 789, 2024]
 
 TARGET_ENCODE_COLS = [
@@ -81,15 +82,14 @@ print(f"    Fraud rate: {y.mean():.4f}  ({n_fraud:,} fraud / {n_total - n_fraud:
 # ── Preprocess fold ───────────────────────────────────────────────────────────
 
 def preprocess_fold(
-    X_train: pl.DataFrame,
-    y_train: np.ndarray,
-    X_val:   pl.DataFrame,
+    X_train:       pl.DataFrame,
+    y_train:       np.ndarray,
+    X_val:         pl.DataFrame,
     X_test_polars: pl.DataFrame | None = None,
 ) -> tuple:
     """
     Fold-safe preprocessing: fit тільки на X_train, transform на val і test.
-    Якщо передано X_test_polars — повертає (X_train_pd, X_val_pd, X_test_pd).
-    Інакше — (X_train_pd, X_val_pd).
+    Повертає (X_train_pd, X_val_pd) або (X_train_pd, X_val_pd, X_test_pd).
     """
     imputer = PolarsImputer()
     imputer.fit(X_train)
@@ -97,8 +97,8 @@ def preprocess_fold(
     X_val_i   = imputer.transform(X_val)
 
     enc = PolarsTargetEncoder(cat_cols=TARGET_ENCODE_COLS)
-    X_train_e = enc.fit_transform(X_train_i, y_train)   # LOO на train
-    X_val_e   = enc.transform(X_val_i)                   # plain lookup на val
+    X_train_e = enc.fit_transform(X_train_i, y_train)  # LOO на train
+    X_val_e   = enc.transform(X_val_i)                  # plain lookup на val
 
     frame = PolarsToModelFrame(drop_cols=[ID_COL])
     frame.fit(X_train_e)
@@ -142,7 +142,6 @@ for seed_idx, seed in enumerate(ENSEMBLE_SEEDS, 1):
     fold_aucs: list[float] = []
 
     for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(y)), y), start=1):
-        # preprocess_fold з X_test — encoder fit на train fold, transform test одразу
         X_train_pd, X_val_pd, X_test_pd = preprocess_fold(
             X[train_idx], y[train_idx], X[val_idx], X_test_polars=X_test
         )
@@ -162,7 +161,7 @@ for seed_idx, seed in enumerate(ENSEMBLE_SEEDS, 1):
             f"proba [{oof_proba_seed[val_idx].min():.4f}–{oof_proba_seed[val_idx].max():.4f}]"
         )
 
-    seed_auc      = float(np.mean(fold_aucs))
+    seed_auc          = float(np.mean(fold_aucs))
     seed_thr, seed_f1 = find_best_threshold(y, oof_proba_seed)
     print(f"    Seed {seed} → AUC={seed_auc:.4f}  OOF F1={seed_f1:.4f}@{seed_thr:.4f}\n")
 
@@ -171,21 +170,43 @@ for seed_idx, seed in enumerate(ENSEMBLE_SEEDS, 1):
 
 
 # ── Threshold optimisation ────────────────────────────────────────────────────
+# Порівнюємо два підходи і беремо кращий:
+#   1. find_best_threshold — лінійний пошук по абсолютних значеннях proba
+#   2. find_best_topk      — rank-based, не залежить від абсолютних значень
+#                            переважає коли proba стиснуті в вузький діапазон
 
 print("[7] Threshold optimisation on ensemble OOF...")
 print("-" * 65)
 
-optimal_threshold, oof_f1 = find_best_threshold(y, oof_proba_accum)
-oof_pred = (oof_proba_accum >= optimal_threshold).astype(int)
-tp = int(np.sum((oof_pred == 1) & (y == 1)))
-fp = int(np.sum((oof_pred == 1) & (y == 0)))
-fn = int(np.sum((oof_pred == 0) & (y == 1)))
-p  = tp / max(tp + fp, 1)
-r  = tp / max(tp + fn, 1)
-oof_auc = roc_auc_score(y, oof_proba_accum)
+thr_abs, f1_abs   = find_best_threshold(y, oof_proba_accum)
+k_opt, f1_topk, thr_topk = find_best_topk(y, oof_proba_accum)
 
-print(f"  thr={optimal_threshold:.4f} | F1={oof_f1:.4f} | P={p:.4f} | R={r:.4f}")
-print(f"  TP={tp}  FP={fp}  FN={fn}")
+pred_abs  = (oof_proba_accum >= thr_abs).astype(int)
+tp_a = int(np.sum((pred_abs == 1) & (y == 1)))
+fp_a = int(np.sum((pred_abs == 1) & (y == 0)))
+fn_a = int(np.sum((pred_abs == 0) & (y == 1)))
+
+pred_topk = (oof_proba_accum >= thr_topk).astype(int)
+tp_k = int(np.sum((pred_topk == 1) & (y == 1)))
+fp_k = int(np.sum((pred_topk == 1) & (y == 0)))
+fn_k = int(np.sum((pred_topk == 0) & (y == 1)))
+
+print(f"  Threshold search : thr={thr_abs:.4f} | F1={f1_abs:.4f} | "
+      f"P={tp_a/max(tp_a+fp_a,1):.4f} | R={tp_a/max(tp_a+fn_a,1):.4f} | TP={tp_a} FP={fp_a} FN={fn_a}")
+print(f"  Rank Top-K={k_opt:,}  : thr={thr_topk:.4f} | F1={f1_topk:.4f} | "
+      f"P={tp_k/max(tp_k+fp_k,1):.4f} | R={tp_k/max(tp_k+fn_k,1):.4f} | TP={tp_k} FP={fp_k} FN={fn_k}")
+
+if f1_topk >= f1_abs:
+    optimal_threshold = thr_topk
+    oof_f1            = f1_topk
+    winner            = f"Rank Top-K={k_opt:,} (F1={f1_topk:.4f})"
+else:
+    optimal_threshold = thr_abs
+    oof_f1            = f1_abs
+    winner            = f"Threshold search (F1={f1_abs:.4f})"
+
+oof_auc = roc_auc_score(y, oof_proba_accum)
+print(f"\n  → Using {winner}")
 print("-" * 65)
 print(f"\n  OOF AUC : {oof_auc:.4f}")
 print(f"  OOF F1  : {oof_f1:.4f}")
@@ -196,6 +217,27 @@ print(f"  OOF F1  : {oof_f1:.4f}")
 print("\n[8] Building submission...")
 submission = build_submission(test_filtered, test_proba_accum, optimal_threshold)
 submission.write_csv(SUBMISSION_PATH)
+
+predicted_fraud_rate_test = float(submission["is_fraud"].mean())
+
+
+# ── Business analyst report (незалежно від submission) ───────────────────────
+# Генерується на базі OOF proba які вже є в пам'яті.
+# Не впливає на submission — просто записує CSV для аналітика.
+
+print("\n[9] Exporting business analyst report...")
+export_threshold_report(
+    y_true=y,
+    oof_proba=oof_proba_accum,
+    optimal_threshold=optimal_threshold,
+    oof_f1=oof_f1,
+    oof_auc=oof_auc,
+    n_train_total=train_raw.height,
+    n_test_total=test_raw.height,
+    predicted_fraud_rate_test=predicted_fraud_rate_test,
+    output_path=THRESHOLD_REPORT_PATH,
+)
+
 
 print(f"\n{'='*65}")
 print(f"  Saved → {SUBMISSION_PATH}")
