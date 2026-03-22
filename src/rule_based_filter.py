@@ -520,9 +520,7 @@ def apply_rule_based_filter(
         .str.strip_chars("|")
         .alias("rule_triggers"),
 
-        pl.when(pl.col("_ab_total") > 0)
-        .then(pl.lit("AUTOBLOCK"))
-        .when(pl.col("_wl_total") > 0)
+        pl.when(pl.col("_wl_total") > 0)
         .then(pl.lit("WHITELIST"))
         .otherwise(pl.lit("SEND_TO_ML"))
         .alias("rule_decision"),
@@ -539,28 +537,19 @@ def apply_rule_based_filter(
 
         if "is_fraud" in out.columns:
             total_fraud = out.filter(pl.col("is_fraud") == 1).height
-            ab = out.filter(pl.col("rule_decision") == "AUTOBLOCK")
 
-            if ab.height > 0:
-                tp = ab.filter(pl.col("is_fraud") == 1).height
-                fp = ab.filter(pl.col("is_fraud") == 0).height
+            # AUTOBLOCK більше не є hard routing — показуємо як діагностику
+            ab_would = out.filter(pl.col("rule_triggers").str.len_chars() > 0)
+            if ab_would.height > 0:
+                tp = ab_would.filter(pl.col("is_fraud") == 1).height
+                fp = ab_would.filter(pl.col("is_fraud") == 0).height
                 precision = tp / max(tp + fp, 1)
                 recall = tp / max(total_fraud, 1)
-                print(f"\n[RULE FILTER] AUTOBLOCK overall: precision={precision:.4f} recall={recall:.4f} (TP={tp} FP={fp})")
+                print(f"\n[RULE FILTER] AUTOBLOCK (diagnostic only, NOT applied): precision={precision:.4f} recall={recall:.4f} (TP={tp} FP={fp})")
+                print("  → All routed to SEND_TO_ML instead (ML decides)")
 
-                # ── Per-trigger precision/recall breakdown ─────────────────
-                # Reconstruct individual trigger columns temporarily for analysis.
-                print("\n[RULE FILTER] Per-trigger breakdown (on users where this trigger fired):")
-                print(f"  {'Rule':<18} {'Fired':>7} {'TP':>7} {'FP':>7} {'Prec':>7} {'Rec/total':>12}")
-
-                trigger_map = {
-                    "A1:triple":    ("antifraud_error_count", "fraud_error_count", "tx_fail_rate"),
-                    "A2:sysblock":  ("has_antifraud_error", "tx_fail_rate", "tx_total_count"),
-                    "A3:velocity":  ("cards_per_day", "tx_fail_rate"),
-                    "A4:geo":       ("geo_mismatch_card_payment", "tx_fail_rate", "antifraud_error_count"),
-                    "A5:score5":    ("rule_score",),
-                    "A6:carding":   ("card_testing_flag", "has_antifraud_error"),
-                }
+                print(f"\n[RULE FILTER] Per-trigger breakdown:")
+                print(f"  {'Rule':<18} {'Fired':>7} {'TP':>7} {'FP':>7} {'Prec':>7}")
                 for label in label_map.values():
                     if label.startswith("W"):
                         continue
@@ -571,9 +560,7 @@ def apply_rule_based_filter(
                     t_tp = fired.filter(pl.col("is_fraud") == 1).height
                     t_fp = fired.filter(pl.col("is_fraud") == 0).height
                     t_prec = t_tp / max(t_tp + t_fp, 1)
-                    t_rec  = t_tp / max(total_fraud, 1)
-                    flag = " ← LOW" if t_prec < 0.30 else ""
-                    print(f"  {label:<18} {fired.height:>7,} {t_tp:>7,} {t_fp:>7,} {t_prec:>7.3f} {t_rec:>10.3f}{flag}")
+                    print(f"  {label:<18} {fired.height:>7,} {t_tp:>7,} {t_fp:>7,} {t_prec:>7.3f}")
 
             wl = out.filter(pl.col("rule_decision") == "WHITELIST")
             if wl.height > 0 and "is_fraud" in out.columns:
@@ -612,27 +599,27 @@ def build_submission(
 ) -> pl.DataFrame:
     parts: list[pl.DataFrame] = []
 
-    for decision, label in [("AUTOBLOCK", 1), ("WHITELIST", 0)]:
-        part = (
-            test_filtered
-            .filter(pl.col("rule_decision") == decision)
-            .select("id_user")
-            .with_columns(pl.lit(label, dtype=pl.Int32).alias("is_fraud"))
-        )
-        parts.append(part)
+    # WHITELIST → завжди legit (precision 99.97%)
+    # AUTOBLOCK більше не є hard routing — всі йдуть через ML
+    wl = (
+        test_filtered
+        .filter(pl.col("rule_decision") == "WHITELIST")
+        .select("id_user")
+        .with_columns(pl.lit(0, dtype=pl.Int32).alias("is_fraud"))
+    )
+    parts.append(wl)
 
     ml_ids = test_filtered.filter(pl.col("rule_decision") == "SEND_TO_ML").select("id_user")
 
     if ml_ids.height > 0:
-            if ml_proba is None:
-                raise ValueError(
-                    f"ml_proba is None but {ml_ids.height} users were routed to SEND_TO_ML. "
-                    "Pass the model probabilities or re-check the rule filter."
-                )
-            ml_labels = (ml_proba >= best_threshold).astype(np.int32)
-            parts.append(
-                ml_ids.with_columns(pl.Series("is_fraud", ml_labels, dtype=pl.Int32))
+        if ml_proba is None:
+            raise ValueError(
+                f"ml_proba is None but {ml_ids.height} users were routed to SEND_TO_ML."
             )
+        ml_labels = (ml_proba >= best_threshold).astype(np.int32)
+        parts.append(
+            ml_ids.with_columns(pl.Series("is_fraud", ml_labels, dtype=pl.Int32))
+        )
 
     submission = pl.concat(parts).sort("id_user")
     print(
