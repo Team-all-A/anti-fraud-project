@@ -15,27 +15,36 @@ NUMERIC_DTYPES = {
 @dataclass
 class RuleConfig:
     # AUTOBLOCK
-    a1_min_fail_rate: float = 0.70
-    a1_min_antifraud_count: int = 1
-    a1_min_fraud_count: int = 1
+    # A1: всі три сигнали одночасно — antifraud + fraud error + висока failure rate.
+    # Підняли fail_rate до 0.95 і count до 3+, щоб precision була близько до 80%+.
+    a1_min_fail_rate: float = 0.95
+    a1_min_antifraud_count: int = 3
+    a1_min_fraud_count: int = 2
 
-    a2_full_block_rate: float = 0.90
+    # A2: системний блок — майже всі транзакції fail + antifraud.
+    # Підняли block_rate до 0.98 і мінімальну кількість tx до 5.
+    a2_full_block_rate: float = 0.98
     a2_min_antifraud: int = 1
-    a2_min_tx_count: int = 3
+    a2_min_tx_count: int = 5
 
-    a3_cards_per_day: float = 50.0
-    a3_min_fail_rate: float = 0.60
+    # A3: velocity — дуже висока кількість карток на день.
+    # Підняли поріг до 200 карток/день (було 50) — лише екстремальний carding.
+    a3_cards_per_day: float = 200.0
+    a3_min_fail_rate: float = 0.80
 
+    # A4: geo mismatch + antifraud — тепер потрібно багато AF помилок.
     a4_geo_mismatch: int = 1
-    a4_min_fail_rate: float = 0.75
-    a4_min_af_errors: int = 3
+    a4_min_fail_rate: float = 0.90
+    a4_min_af_errors: int = 8
 
-    a5_min_score: int = 5
+    # A5: тільки при дуже екстремальному rule_score (максимум = 6).
+    a5_min_score: int = 6
 
+    # A6: card testing — потрібно більше antifraud підтверджень.
     a6_card_testing: int = 1
     a6_has_antifraud: int = 1
 
-    # WHITELIST
+    # WHITELIST — залишаємо як є, вона дає мало FP
     w1_max_score: int = 0
     w1_max_fail_rate: float = 0.05
     w1_min_account_days: float = 30.0
@@ -528,18 +537,49 @@ def apply_rule_based_filter(
             print(f"  {decision:<12} {count:>8,} ({pct:5.1f}%)")
 
         if "is_fraud" in out.columns:
-            ab = out.filter(pl.col("rule_decision") == "AUTOBLOCK")
             total_fraud = out.filter(pl.col("is_fraud") == 1).height
+            ab = out.filter(pl.col("rule_decision") == "AUTOBLOCK")
 
             if ab.height > 0:
                 tp = ab.filter(pl.col("is_fraud") == 1).height
                 fp = ab.filter(pl.col("is_fraud") == 0).height
                 precision = tp / max(tp + fp, 1)
-                print(f"[RULE FILTER] AUTOBLOCK precision: {precision:.4f} (TP={tp}, FP={fp})")
+                recall = tp / max(total_fraud, 1)
+                print(f"\n[RULE FILTER] AUTOBLOCK overall: precision={precision:.4f} recall={recall:.4f} (TP={tp} FP={fp})")
 
-            ab_fraud = ab.filter(pl.col("is_fraud") == 1).height if ab.height > 0 else 0
-            recall = ab_fraud / max(total_fraud, 1)
-            print(f"[RULE FILTER] AUTOBLOCK recall:    {recall:.4f} ({ab_fraud}/{total_fraud})")
+                # ── Per-trigger precision/recall breakdown ─────────────────
+                # Reconstruct individual trigger columns temporarily for analysis.
+                print("\n[RULE FILTER] Per-trigger breakdown (on users where this trigger fired):")
+                print(f"  {'Rule':<18} {'Fired':>7} {'TP':>7} {'FP':>7} {'Prec':>7} {'Rec/total':>12}")
+
+                trigger_map = {
+                    "A1:triple":    ("antifraud_error_count", "fraud_error_count", "tx_fail_rate"),
+                    "A2:sysblock":  ("has_antifraud_error", "tx_fail_rate", "tx_total_count"),
+                    "A3:velocity":  ("cards_per_day", "tx_fail_rate"),
+                    "A4:geo":       ("geo_mismatch_card_payment", "tx_fail_rate", "antifraud_error_count"),
+                    "A5:score5":    ("rule_score",),
+                    "A6:carding":   ("card_testing_flag", "has_antifraud_error"),
+                }
+                for label in label_map.values():
+                    if label.startswith("W"):
+                        continue
+                    fired = out.filter(pl.col("rule_triggers").str.contains(label, literal=True))
+                    if fired.height == 0:
+                        print(f"  {label:<18} {'0':>7}")
+                        continue
+                    t_tp = fired.filter(pl.col("is_fraud") == 1).height
+                    t_fp = fired.filter(pl.col("is_fraud") == 0).height
+                    t_prec = t_tp / max(t_tp + t_fp, 1)
+                    t_rec  = t_tp / max(total_fraud, 1)
+                    flag = " ← LOW" if t_prec < 0.30 else ""
+                    print(f"  {label:<18} {fired.height:>7,} {t_tp:>7,} {t_fp:>7,} {t_prec:>7.3f} {t_rec:>10.3f}{flag}")
+
+            wl = out.filter(pl.col("rule_decision") == "WHITELIST")
+            if wl.height > 0 and "is_fraud" in out.columns:
+                wl_fn = wl.filter(pl.col("is_fraud") == 1).height
+                wl_tn = wl.filter(pl.col("is_fraud") == 0).height
+                wl_prec = wl_tn / max(wl.height, 1)
+                print(f"\n[RULE FILTER] WHITELIST: precision(legit)={wl_prec:.4f} (TN={wl_tn} FN={wl_fn})")
 
     return out
 

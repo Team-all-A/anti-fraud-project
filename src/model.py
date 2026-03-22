@@ -8,7 +8,7 @@ import optuna
 import polars as pl
 from lightgbm import LGBMClassifier
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.metrics import f1_score, roc_auc_score
+from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
 
 RANDOM_STATE = 42
@@ -132,8 +132,9 @@ def run_optuna(
     n_splits: int = 5,
 ) -> dict:
     auto_spw = compute_scale_pos_weight(y)
-    spw_lo   = max(10.0, auto_spw * 0.5)
-    spw_hi   = auto_spw * 2.0
+    # Тримаємо range ближче до реального ratio — щоб модель не ховала ймовірності.
+    spw_lo   = max(10.0, auto_spw * 0.7)
+    spw_hi   = auto_spw * 1.5
     print(f"  scale_pos_weight range: [{spw_lo:.1f}, {spw_hi:.1f}]  (auto={auto_spw:.1f})")
 
     def objective(trial: optuna.Trial) -> float:
@@ -161,8 +162,12 @@ def run_optuna(
             clf = FraudLGBMClassifier(lgbm_params=params)
             clf.fit(X_train_pd, y[train_idx], eval_set=[(X_val_pd, y[val_idx])])
 
-            auc = roc_auc_score(y[val_idx], clf.predict_proba(X_val_pd)[:, 1])
-            scores.append(auc)
+            # ── Оптимізуємо F1, а не AUC ──────────────────────────────────
+            # find_best_threshold шукає поріг, що максимізує F1 на val.
+            # Це вирівнює hyperparameter search з фінальною метрикою змагання.
+            probs = clf.predict_proba(X_val_pd)[:, 1]
+            _, fold_f1 = find_best_threshold(y[val_idx], probs)
+            scores.append(fold_f1)
 
             trial.report(float(np.mean(scores)), fold)
             if trial.should_prune():
@@ -177,6 +182,6 @@ def run_optuna(
     )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
-    print(f"\nOptuna best CV AUC : {study.best_value:.4f}")
+    print(f"\nOptuna best CV F1  : {study.best_value:.4f}")
     print(f"Best params        : {study.best_params}")
     return study.best_params

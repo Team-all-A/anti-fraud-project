@@ -44,20 +44,22 @@ def optimize_threshold(
     y_proba: np.ndarray,
 ) -> tuple[float, float, dict]:
     """
-    Знаходить поріг з максимальним F1.
+    Знаходить поріг з максимальним F1 на OOF-ймовірностях.
     Повертає (best_threshold, best_f1, metrics_dict).
     """
     df = evaluate_thresholds(y_true, y_proba)
     best_row = df.filter(pl.col("f1") == df["f1"].max()).row(0, named=True)
 
+    best_f1 = best_row["f1"]
+
     return (
         best_row["threshold"],
-        best_row["f1"],
+        best_f1,
         {
             "tp": best_row["tp"], "tn": best_row["tn"],
             "fp": best_row["fp"], "fn": best_row["fn"],
             "precision": best_row["precision"],
             "recall":    best_row["recall"],
-            "f1":        best_row["f1"],
+            "f1":        best_f1,
         },
     )

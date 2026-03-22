@@ -8,7 +8,7 @@ from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 from src.business import optimize_threshold
-from src.model import get_model, run_optuna
+from src.model import get_model, run_optuna, find_best_threshold
 from src.preprocessing import PolarsImputer, PolarsToModelFrame, PolarsTargetEncoder, load_and_merge
 from src.rule_based_filter import (
     apply_rule_based_filter,
@@ -146,7 +146,8 @@ skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE
 
 oof_proba  = np.zeros(len(y), dtype=float)
 test_proba = np.zeros(X_test.height, dtype=float)
-fold_f1s: list[float] = []
+fold_aucs: list[float] = []
+fold_f1s:  list[float] = []
 
 print(f"\nOOF CV with best params ({N_SPLITS} folds)...\n")
 
@@ -168,14 +169,17 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(y)), y), star
 
     val_proba = oof_proba[val_idx]
     fold_auc  = roc_auc_score(y_val_fold, val_proba)
-    fold_f1s.append(fold_auc)
+    _, fold_f1 = find_best_threshold(y_val_fold, val_proba)
+    fold_aucs.append(fold_auc)
+    fold_f1s.append(fold_f1)
     print(
-        f"  Fold {fold}: AUC={fold_auc:.4f} | "
-        f"proba min={val_proba.min():.3f} mean={val_proba.mean():.3f} max={val_proba.max():.3f} | "
+        f"  Fold {fold}: AUC={fold_auc:.4f}  F1={fold_f1:.4f} | "
+        f"proba min={val_proba.min():.4f} mean={val_proba.mean():.4f} max={val_proba.max():.4f} | "
         f"fraud {y_val_fold.sum()}/{len(y_val_fold)}"
     )
 
-print(f"\nCV mean AUC: {np.mean(fold_f1s):.4f} ± {np.std(fold_f1s):.4f}")
+print(f"\nCV mean AUC: {np.mean(fold_aucs):.4f} ± {np.std(fold_aucs):.4f}")
+print(f"CV mean F1 : {np.mean(fold_f1s):.4f} ± {np.std(fold_f1s):.4f}")
 
 # ── Аналіз розподілу ймовірностей ─────────────────────────────────────────────
 print("\nOOF Probability distribution:")
@@ -195,14 +199,13 @@ print(f"  Mean proba for LEGIT (y=0): {oof_proba[~fraud_mask].mean():.5f}")
 # ── 8. Threshold optimisation on OOF predictions ─────────────────────────────
 
 print("\nOptimising threshold on OOF predictions...")
-optimal_threshold, min_cost, metrics = optimize_threshold(
+optimal_threshold, best_f1, metrics = optimize_threshold(
     y_true=y,
     y_proba=oof_proba,
-    cost_fp=COST_FP,
-    cost_fn=COST_FN,
 )
-print(f"Threshold : {optimal_threshold:.2f} | Cost: ${min_cost:,.2f}")
+print(f"Threshold : {optimal_threshold:.4f} | OOF F1: {best_f1:.4f}")
 print(f"F1={metrics['f1']:.4f} | Precision={metrics['precision']:.4f} | Recall={metrics['recall']:.4f}")
+print(f"TP={metrics['tp']} | FP={metrics['fp']} | FN={metrics['fn']} | TN={metrics['tn']}")
 
 
 # ── 9. Submission ─────────────────────────────────────────────────────────────
