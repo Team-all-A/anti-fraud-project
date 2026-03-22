@@ -181,27 +181,47 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(y)), y), star
 print(f"\nCV mean AUC: {np.mean(fold_aucs):.4f} ± {np.std(fold_aucs):.4f}")
 print(f"CV mean F1 : {np.mean(fold_f1s):.4f} ± {np.std(fold_f1s):.4f}")
 
-# ── Аналіз розподілу ймовірностей ─────────────────────────────────────────────
-print("\nOOF Probability distribution:")
-print(f"  Min:    {oof_proba.min():.5f}")
-print(f"  Median: {np.median(oof_proba):.5f}")
-print(f"  Mean:   {oof_proba.mean():.5f}")
-print(f"  90th %: {np.percentile(oof_proba, 90):.5f}")
-print(f"  95th %: {np.percentile(oof_proba, 95):.5f}")
-print(f"  99th %: {np.percentile(oof_proba, 99):.5f}")
-print(f"  Max:    {oof_proba.max():.5f}")
+# ── Probability calibration (isotonic) ───────────────────────────────────────
+# OOF ймовірності стиснуті навколо prior (~0.03) через низький scale_pos_weight.
+# Isotonic regression відображає raw proba → calibrated proba без витоку:
+# вона fit на OOF (вже out-of-fold), apply на test через той самий маппінг.
+# ── Probability calibration (Platt scaling) ───────────────────────────────────
+# Isotonic regression overfits на вузькому діапазоні (0.034–0.054) і будує
+# ступінчасту функцію → більшість прогнозів йде до 0 або 1.
+# LogisticRegression (Platt) — плавна монотонна функція, менш схильна до overfitting.
+# Fit на OOF (out-of-fold) → застосовуємо той самий маппінг до test.
+from sklearn.linear_model import LogisticRegression as _LR
+
+print("\nCalibrating probabilities (Platt scaling)...")
+platt = _LR(C=1.0, solver="lbfgs", max_iter=1000)
+platt.fit(oof_proba.reshape(-1, 1), y)
+oof_proba_cal  = platt.predict_proba(oof_proba.reshape(-1, 1))[:, 1]
+test_proba_cal = platt.predict_proba(test_proba.reshape(-1, 1))[:, 1]
 
 fraud_mask = (y == 1)
-print(f"\n  Mean proba for FRAUD (y=1): {oof_proba[fraud_mask].mean():.5f}")
-print(f"  Mean proba for LEGIT (y=0): {oof_proba[~fraud_mask].mean():.5f}")
+print(f"  Before cal → fraud mean={oof_proba[fraud_mask].mean():.5f}  legit mean={oof_proba[~fraud_mask].mean():.5f}")
+print(f"  After  cal → fraud mean={oof_proba_cal[fraud_mask].mean():.5f}  legit mean={oof_proba_cal[~fraud_mask].mean():.5f}")
+
+# ── Аналіз розподілу ймовірностей ─────────────────────────────────────────────
+print("\nOOF Calibrated probability distribution:")
+print(f"  Min:    {oof_proba_cal.min():.5f}")
+print(f"  Median: {np.median(oof_proba_cal):.5f}")
+print(f"  Mean:   {oof_proba_cal.mean():.5f}")
+print(f"  90th %: {np.percentile(oof_proba_cal, 90):.5f}")
+print(f"  95th %: {np.percentile(oof_proba_cal, 95):.5f}")
+print(f"  99th %: {np.percentile(oof_proba_cal, 99):.5f}")
+print(f"  Max:    {oof_proba_cal.max():.5f}")
+
+print(f"\n  Mean proba for FRAUD (y=1): {oof_proba_cal[fraud_mask].mean():.5f}")
+print(f"  Mean proba for LEGIT (y=0): {oof_proba_cal[~fraud_mask].mean():.5f}")
 
 
-# ── 8. Threshold optimisation on OOF predictions ─────────────────────────────
+# ── 8. Threshold optimisation on calibrated OOF predictions ──────────────────
 
-print("\nOptimising threshold on OOF predictions...")
+print("\nOptimising threshold on calibrated OOF predictions...")
 optimal_threshold, best_f1, metrics = optimize_threshold(
     y_true=y,
-    y_proba=oof_proba,
+    y_proba=oof_proba_cal,
 )
 print(f"Threshold : {optimal_threshold:.4f} | OOF F1: {best_f1:.4f}")
 print(f"F1={metrics['f1']:.4f} | Precision={metrics['precision']:.4f} | Recall={metrics['recall']:.4f}")
@@ -210,6 +230,6 @@ print(f"TP={metrics['tp']} | FP={metrics['fp']} | FN={metrics['fn']} | TN={metri
 
 # ── 9. Submission ─────────────────────────────────────────────────────────────
 
-submission = build_submission(test_filtered, test_proba, optimal_threshold)
+submission = build_submission(test_filtered, test_proba_cal, optimal_threshold)
 submission.write_csv(SUBMISSION_PATH)
 print(f"\nSaved {SUBMISSION_PATH}")

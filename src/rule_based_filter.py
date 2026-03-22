@@ -404,7 +404,7 @@ def build_flat_user_dataset(df: pl.DataFrame, is_train: bool = True) -> pl.DataF
 
 
 def build_risk_indicators(flat: pl.DataFrame) -> pl.DataFrame:
-    return flat.with_columns([
+    df = flat.with_columns([
         (
             (pl.col("tx_amount_min") < 1.0) &
             (pl.col("tx_fail_count") >= 2)
@@ -425,6 +425,65 @@ def build_risk_indicators(flat: pl.DataFrame) -> pl.DataFrame:
             pl.col("micro_payment_flag").cast(pl.Int64)
         ).cast(pl.Int8).alias("rule_score")
     ])
+
+    # ── Interaction features — дають ML сильніший signal ──────────────────────
+    # Ці фічі комбінують сигнали які окремо слабкі, але разом дискримінуючі.
+    interaction_exprs = []
+
+    # antifraud rate = antifraud_count / tx_total — нормалізований сигнал
+    if {"antifraud_error_count", "tx_total_count"}.issubset(df.columns):
+        interaction_exprs.append(
+            (pl.col("antifraud_error_count").cast(pl.Float64) /
+             (pl.col("tx_total_count").cast(pl.Float64) + 1.0))
+            .alias("antifraud_rate")
+        )
+
+    # fail × antifraud interaction — обидва одночасно → сильний сигнал фроду
+    if {"tx_fail_rate", "antifraud_error_count"}.issubset(df.columns):
+        interaction_exprs.append(
+            (pl.col("tx_fail_rate") * pl.col("antifraud_error_count").cast(pl.Float64))
+            .alias("fail_x_antifraud")
+        )
+
+    # cards × fail_rate — carding pattern
+    if {"unique_cards_count", "tx_fail_rate"}.issubset(df.columns):
+        interaction_exprs.append(
+            (pl.col("unique_cards_count").cast(pl.Float64) * pl.col("tx_fail_rate"))
+            .alias("cards_x_fail_rate")
+        )
+
+    # geo_mismatch × fail_rate — geo anomaly підсилена failures
+    if {"geo_mismatch_triple", "tx_fail_rate"}.issubset(df.columns):
+        interaction_exprs.append(
+            (pl.col("geo_mismatch_triple").cast(pl.Float64) * pl.col("tx_fail_rate"))
+            .alias("geo_x_fail_rate")
+        )
+
+    # rule_score × fail_rate — загальний ризик × failure intensity
+    interaction_exprs.append(
+        (pl.col("rule_score").cast(pl.Float64) * pl.col("tx_fail_rate"))
+        .alias("score_x_fail_rate")
+    )
+
+    # швидкість реєстрації → перша транзакція (низьке значення = підозріло)
+    if "delta_reg_to_first_tx_hours" in df.columns:
+        interaction_exprs.append(
+            pl.when(pl.col("delta_reg_to_first_tx_hours") < 1.0)
+            .then(pl.lit(1)).otherwise(pl.lit(0))
+            .cast(pl.Int8).alias("instant_tx_after_reg")
+        )
+
+    # null card holder на non-gpay транзакціях — сильний fraud signal
+    if {"card_holder_is_null_rate", "tx_total_count"}.issubset(df.columns):
+        interaction_exprs.append(
+            (pl.col("card_holder_is_null_rate") * pl.col("tx_total_count").cast(pl.Float64))
+            .alias("null_holder_x_count")
+        )
+
+    if interaction_exprs:
+        df = df.with_columns(interaction_exprs)
+
+    return df
 
 
 def apply_rule_based_filter(
@@ -448,10 +507,8 @@ def apply_rule_based_filter(
             (pl.col("tx_total_count") >= cfg.a2_min_tx_count)
         ).then(1).otherwise(0).cast(pl.Int8).alias("_a2_system_block"),
 
-        pl.when(
-            (pl.col("cards_per_day") > cfg.a3_cards_per_day) &
-            (pl.col("tx_fail_rate") > cfg.a3_min_fail_rate)
-        ).then(1).otherwise(0).cast(pl.Int8).alias("_a3_velocity"),
+        # _a3_velocity видалено з AUTOBLOCK — precision=0.26, занадто багато FP.
+        # cards_per_day залишається як числова фіча для LightGBM.
 
         pl.when(
             (pl.col("geo_mismatch_card_payment") == cfg.a4_geo_mismatch) &
@@ -485,7 +542,8 @@ def apply_rule_based_filter(
     autoblock_cols = [
         "_a1_triple_confirm",
         "_a2_system_block",
-        "_a3_velocity",
+        # A3:velocity вилучено — precision=0.26, дає 74% всіх FP у AUTOBLOCK.
+        # cards_per_day залишається як фіча для ML-моделі.
         "_a4_geo_carding",
         "_a5_extreme_score",
         "_a6_card_testing",
@@ -500,7 +558,7 @@ def apply_rule_based_filter(
     label_map = {
         "_a1_triple_confirm": "A1:triple",
         "_a2_system_block": "A2:sysblock",
-        "_a3_velocity": "A3:velocity",
+        # A3:velocity — вилучено з AUTOBLOCK, не логуємо як тригер блокування
         "_a4_geo_carding": "A4:geo",
         "_a5_extreme_score": "A5:score5",
         "_a6_card_testing": "A6:carding",
