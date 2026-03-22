@@ -109,7 +109,6 @@ def get_default_lgbm_params(y_train: np.ndarray | None = None) -> dict:
         "num_leaves":        63,
         "max_depth":         -1,
         "min_child_samples": 20,
-        "min_split_gain":    0.0,
         "subsample":         0.8,
         "subsample_freq":    1,
         "colsample_bytree":  0.7,
@@ -145,8 +144,6 @@ def run_optuna(
             "num_leaves":        trial.suggest_int(  "num_leaves",          31,  200),
             "max_depth":         trial.suggest_int(  "max_depth",            4,   10),
             "min_child_samples": trial.suggest_int(  "min_child_samples",    5,   60),
-            # min_split_gain — додаткова регуляризація дерев (не було раніше)
-            "min_split_gain":    trial.suggest_float("min_split_gain",     0.0,  0.5),
             "subsample":         trial.suggest_float("subsample",           0.5,  1.0),
             "subsample_freq":    1,
             "colsample_bytree":  trial.suggest_float("colsample_bytree",    0.4,  1.0),
