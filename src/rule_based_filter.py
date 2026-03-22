@@ -426,63 +426,6 @@ def build_risk_indicators(flat: pl.DataFrame) -> pl.DataFrame:
         ).cast(pl.Int8).alias("rule_score")
     ])
 
-    # ── Interaction features — дають ML сильніший signal ──────────────────────
-    # Ці фічі комбінують сигнали які окремо слабкі, але разом дискримінуючі.
-    interaction_exprs = []
-
-    # antifraud rate = antifraud_count / tx_total — нормалізований сигнал
-    if {"antifraud_error_count", "tx_total_count"}.issubset(df.columns):
-        interaction_exprs.append(
-            (pl.col("antifraud_error_count").cast(pl.Float64) /
-             (pl.col("tx_total_count").cast(pl.Float64) + 1.0))
-            .alias("antifraud_rate")
-        )
-
-    # fail × antifraud interaction — обидва одночасно → сильний сигнал фроду
-    if {"tx_fail_rate", "antifraud_error_count"}.issubset(df.columns):
-        interaction_exprs.append(
-            (pl.col("tx_fail_rate") * pl.col("antifraud_error_count").cast(pl.Float64))
-            .alias("fail_x_antifraud")
-        )
-
-    # cards × fail_rate — carding pattern
-    if {"unique_cards_count", "tx_fail_rate"}.issubset(df.columns):
-        interaction_exprs.append(
-            (pl.col("unique_cards_count").cast(pl.Float64) * pl.col("tx_fail_rate"))
-            .alias("cards_x_fail_rate")
-        )
-
-    # geo_mismatch × fail_rate — geo anomaly підсилена failures
-    if {"geo_mismatch_triple", "tx_fail_rate"}.issubset(df.columns):
-        interaction_exprs.append(
-            (pl.col("geo_mismatch_triple").cast(pl.Float64) * pl.col("tx_fail_rate"))
-            .alias("geo_x_fail_rate")
-        )
-
-    # rule_score × fail_rate — загальний ризик × failure intensity
-    interaction_exprs.append(
-        (pl.col("rule_score").cast(pl.Float64) * pl.col("tx_fail_rate"))
-        .alias("score_x_fail_rate")
-    )
-
-    # швидкість реєстрації → перша транзакція (низьке значення = підозріло)
-    if "delta_reg_to_first_tx_hours" in df.columns:
-        interaction_exprs.append(
-            pl.when(pl.col("delta_reg_to_first_tx_hours") < 1.0)
-            .then(pl.lit(1)).otherwise(pl.lit(0))
-            .cast(pl.Int8).alias("instant_tx_after_reg")
-        )
-
-    # null card holder на non-gpay транзакціях — сильний fraud signal
-    if {"card_holder_is_null_rate", "tx_total_count"}.issubset(df.columns):
-        interaction_exprs.append(
-            (pl.col("card_holder_is_null_rate") * pl.col("tx_total_count").cast(pl.Float64))
-            .alias("null_holder_x_count")
-        )
-
-    if interaction_exprs:
-        df = df.with_columns(interaction_exprs)
-
     return df
 
 

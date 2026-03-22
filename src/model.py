@@ -132,11 +132,10 @@ def run_optuna(
     n_splits: int = 5,
 ) -> dict:
     auto_spw = compute_scale_pos_weight(y)
-    # Використовуємо повний діапазон навколо реального ratio.
-    # Попередній range [auto×0.7, auto×1.5] все одно приводив до ~20 (нижня межа).
-    # Тепер мінімум = реальний ratio, максимум = 2× — щоб Optuna пробувала більші значення.
-    spw_lo   = auto_spw
-    spw_hi   = auto_spw * 2.5
+    # Range [auto*0.5, auto*1.5] дає найкращі результати (AUC=0.88, F1=0.27).
+    # Вищий SPW (44+) погіршує AUC до 0.82 — модель нестабільна при великому дисбалансі.
+    spw_lo   = max(10.0, auto_spw * 0.5)
+    spw_hi   = auto_spw * 1.5
     print(f"  scale_pos_weight range: [{spw_lo:.1f}, {spw_hi:.1f}]  (auto={auto_spw:.1f})")
 
     def objective(trial: optuna.Trial) -> float:
