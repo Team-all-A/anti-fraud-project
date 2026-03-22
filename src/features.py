@@ -99,7 +99,60 @@ def add_ratio_features(df: pl.DataFrame) -> pl.DataFrame:
         if alias not in existing:
             exprs.append(expr.alias(alias))
 
-    # ── Error density ──────────────────────────────────────────────────────
+    # ── Amount-based features ──────────────────────────────────────────────
+    # Coefficient of variation — хаотичні суми транзакцій = підозріло
+    if {"tx_amount_std", "tx_amount_mean"} <= existing:
+        _add("amount_cv",
+             pl.col("tx_amount_std") / (pl.col("tx_amount_mean").abs() + _EPS))
+
+    # Range ratio — великий розкид між min i max = carding probe pattern
+    if {"tx_amount_max", "tx_amount_min", "tx_amount_mean"} <= existing:
+        _add("amount_range_ratio",
+             (pl.col("tx_amount_max") - pl.col("tx_amount_min"))
+             / (pl.col("tx_amount_mean").abs() + _EPS))
+
+    # Fail amount proxy — видалено звідси, вже є нижче в оригінальному коді
+
+    # ── Transaction intensity ──────────────────────────────────────────────
+    # Tx per day — аномально висока активність для нового акаунта
+    if {"tx_total_count", "account_age_days"} <= existing:
+        _add("tx_per_day",
+             pl.col("tx_total_count") / (pl.col("account_age_days") + _EPS))
+
+    # Fail per day — burst failures normalised by account age
+    if {"tx_fail_count", "account_age_days"} <= existing:
+        _add("fail_per_day",
+             pl.col("tx_fail_count") / (pl.col("account_age_days") + _EPS))
+
+    # ── Cross-signal interactions ──────────────────────────────────────────
+    # af_rate × unique_cards — комбінація antifraud density + card diversity
+    if {"af_rate", "unique_cards_count"} <= existing:
+        _add("af_rate_x_cards",
+             pl.col("af_rate") * pl.col("unique_cards_count").cast(pl.Float64))
+
+    # cvv × night — CVV errors at night = automated carding
+    if {"cvv_rate", "night_tx_rate"} <= existing:
+        _add("cvv_x_night",
+             pl.col("cvv_rate") * pl.col("night_tx_rate"))
+
+    # dnh × fail — "do not honor" combined with fail rate
+    if {"dnh_rate", "tx_fail_rate"} <= existing:
+        _add("dnh_x_fail",
+             pl.col("dnh_rate") * pl.col("tx_fail_rate"))
+
+    # af_rate × tx_per_day — antifraud density + speed (strongest combined signal)
+    if {"af_rate", "tx_per_day"} <= existing:
+        _add("af_rate_x_tx_per_day",
+             pl.col("af_rate") * pl.col("tx_per_day"))
+
+    # ── Card holder anomaly ────────────────────────────────────────────────
+    # Ratio of unique card holders to unique cards — normally 1:1
+    if {"unique_card_holders_count", "unique_cards_count"} <= existing:
+        _add("holders_per_card",
+             pl.col("unique_card_holders_count").cast(pl.Float64)
+             / (pl.col("unique_cards_count").cast(pl.Float64) + _EPS))
+
+    # Error density ──────────────────────────────────────────────────────
     if {"antifraud_error_count", "tx_total_count"} <= existing:
         _add("af_rate",
              pl.col("antifraud_error_count") / (pl.col("tx_total_count") + _EPS))
@@ -549,6 +602,74 @@ def build_flat_user_dataset(df: pl.DataFrame, is_train: bool = True) -> pl.DataF
 
     temporal = temporal.drop(["_eur_s", "_ttl", "_ts_max", "_ts_min"])
 
+    # ── Entity features (cross-user graph signals) ─────────────────────────
+    # Обчислюються глобально з транзакцій (без is_fraud) — безпечні для test.
+    # Кожна фіча описує "мережевий" контекст юзера: скільки інших юзерів
+    # ділять ту саму картку / card_holder / payment_country.
+
+    entity_parts: list[pl.DataFrame] = []
+
+    # 1. Скільки юзерів ділять одну картку (carding syndicate)
+    if "card_mask_hash" in tx.columns:
+        card_user_count = (
+            tx.group_by("card_mask_hash")
+            .agg(pl.col("id_user").n_unique().alias("_users_per_card"))
+        )
+        user_card_entity = (
+            tx.select(["id_user", "card_mask_hash"]).unique()
+            .join(card_user_count, on="card_mask_hash", how="left")
+            .group_by("id_user")
+            .agg([
+                pl.col("_users_per_card").max().alias("max_users_per_card"),
+                pl.col("_users_per_card").mean().alias("mean_users_per_card"),
+                (pl.col("_users_per_card") > 1).any().cast(pl.Int8).alias("has_shared_card"),
+                (pl.col("_users_per_card") > 5).any().cast(pl.Int8).alias("has_widely_shared_card"),
+            ])
+        )
+        entity_parts.append(user_card_entity)
+
+    # 2. Скільки юзерів за одним іменем card_holder (synthetic identity)
+    if "card_holder" in tx.columns:
+        holder_user_count = (
+            tx.filter(pl.col("card_holder").is_not_null())
+            .group_by("card_holder")
+            .agg(pl.col("id_user").n_unique().alias("_users_per_holder"))
+        )
+        user_holder_entity = (
+            tx.filter(pl.col("card_holder").is_not_null())
+            .select(["id_user", "card_holder"]).unique()
+            .join(holder_user_count, on="card_holder", how="left")
+            .group_by("id_user")
+            .agg([
+                pl.col("_users_per_holder").max().alias("max_users_per_holder"),
+                (pl.col("_users_per_holder") > 3).any().cast(pl.Int8).alias("has_shared_holder"),
+            ])
+        )
+        entity_parts.append(user_holder_entity)
+
+    # 3. Скільки унікальних карток використовувалось у payment_country юзера
+    # (наскільки "гарячий" ринок — багато карток з одного регіону = carding hub)
+    if {"card_mask_hash", "payment_country"} <= set(tx.columns):
+        country_card_count = (
+            tx.filter(pl.col("payment_country").is_not_null())
+            .group_by("payment_country")
+            .agg(pl.col("card_mask_hash").n_unique().alias("_cards_in_country"))
+        )
+        dominant_country = (
+            tx.filter(pl.col("payment_country").is_not_null())
+            .group_by(["id_user", "payment_country"]).len()
+            .sort(["id_user", "len"], descending=[False, True])
+            .group_by("id_user")
+            .agg(pl.col("payment_country").first().alias("_dom_country"))
+        )
+        user_country_entity = (
+            dominant_country
+            .join(country_card_count, left_on="_dom_country", right_on="payment_country", how="left")
+            .select(["id_user",
+                     pl.col("_cards_in_country").alias("cards_in_dominant_country")])
+        )
+        entity_parts.append(user_country_entity)
+
     # ── Join all parts ─────────────────────────────────────────────────────
     out = (
         user_static
@@ -558,6 +679,9 @@ def build_flat_user_dataset(df: pl.DataFrame, is_train: bool = True) -> pl.DataF
         .join(card,           on="id_user", how="left")
         .join(temporal,       on="id_user", how="left")
     )
+
+    for entity_df in entity_parts:
+        out = out.join(entity_df, on="id_user", how="left")
 
     # Fill numeric nulls with 0
     num_fill = [
